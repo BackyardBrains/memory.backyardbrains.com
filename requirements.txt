@@ -1,0 +1,17 @@
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlmodel>=0.0.22
+pgvector>=0.3.6
+psycopg2-binary>=2.9.10
+alembic>=1.14.0
+python-dotenv>=1.0.0
+
+# Embeddings (local / Hugging Face)
+sentence-transformers>=3.3.0
+
+# HTTP client for MCP -> API
+httpx>=0.28.0
+
+# MCP adapter
+fastmcp>=0.1.0

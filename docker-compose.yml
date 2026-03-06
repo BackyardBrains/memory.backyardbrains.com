@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  memory-db:
+    image: pgvector/pgvector:pg16
+    container_name: memory_postgres
+    environment:
+      POSTGRES_USER: byb_memory
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-super_secret_local_password}
+      POSTGRES_DB: openbrain
+    ports:
+      - "5433:5432"
+    volumes:
+      - memory_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  memory_db_data:
