@@ -1,6 +1,8 @@
 # memory.backyardbrains.com
 
-Canonical memory service for OpenClaw. Replaces the flat-file JSON-LD ontology with a PostgreSQL + pgvector backend.
+A knowledge base and semantic search backend for AI assistants. Stores projects, tasks, and events in PostgreSQL with [pgvector](https://github.com/pgvector/pgvector), so LLMs can search and retrieve relevant context when helping you plan or prioritize work.
+
+This service powers Watson and other MCP servers that need access to structured, searchable task and project data.
 
 ## Quick Start
 
