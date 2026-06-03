@@ -18,7 +18,11 @@ def _api_headers() -> dict:
 
 mcp = FastMCP(
     name="Memory MCP",
-    instructions="Memory service for OpenClaw. Use tools to search, capture notes, and manage tasks.",
+    instructions=(
+        "BYB Shared Memory service. Use byb_memory_search for canonical recall and "
+        "byb_memory_capture_verified for durable user memory. Do not claim a note was "
+        "saved unless the verified capture tool reports verified=true."
+    ),
 )
 
 
@@ -32,9 +36,17 @@ def search_memory(
     limit: int = 10,
     project_slug: Optional[str] = None,
 ) -> str:
-    """Search the memory store. Use for vague or semantic-style queries.
-    Returns matching captures and context.
-    """
+    """Legacy alias for BYB Shared Memory search. Prefer byb_memory_search."""
+    return byb_memory_search(query=query, limit=limit, project_slug=project_slug)
+
+
+@mcp.tool
+def byb_memory_search(
+    query: str = "",
+    limit: int = 10,
+    project_slug: Optional[str] = None,
+) -> str:
+    """Search canonical BYB Shared Memory with exact, lexical, then semantic ranking."""
     params = {"q": query, "limit": limit}
     if project_slug:
         params["project_slug"] = project_slug
@@ -48,7 +60,9 @@ def search_memory(
     data = r.json()
     if isinstance(data, list):
         return "\n".join(
-            f"- [{c.get('created_at', '')}] source={c.get('source', 'unknown')} {c.get('raw_content', '')}"
+            f"- [{c.get('created_at', '')}] system={c.get('memory_system', 'BYB Shared Memory')} "
+            f"match={c.get('match_type', 'unknown')} source={c.get('source', 'unknown')} "
+            f"id={c.get('capture_id', c.get('id', '?'))} {c.get('raw_content', '')}"
             for c in data
         )
     return str(data)
@@ -56,19 +70,87 @@ def search_memory(
 
 @mcp.tool
 def capture_note(raw_content: str, source: str = "mcp") -> str:
-    """Add a raw note to the inbox (captures table). Use for unstructured input
-    like voice memos, quick thoughts, or scraps. The note will be persisted
-    and later processed for embeddings/assertions.
-    """
+    """Legacy alias for verified BYB Shared Memory capture. Prefer byb_memory_capture_verified."""
+    return byb_memory_capture_verified(raw_content=raw_content, source=source)
+
+
+@mcp.tool
+def byb_memory_capture_verified(raw_content: str, source: str = "mcp") -> str:
+    """Save a durable note to BYB Shared Memory and verify read-back before success."""
     r = httpx.post(
         f"{MEMORY_API_URL}/v1/captures",
+        params={"sync": "true"},
         json={"raw_content": raw_content, "source": source},
+        headers=_api_headers(),
+        timeout=60.0,
+    )
+    r.raise_for_status()
+    out = r.json()
+    capture_id = out.get("capture_id") or out.get("id") or "?"
+    if out.get("verified"):
+        return f"Captured and verified in BYB Shared Memory (id={capture_id})."
+    if out.get("indexed"):
+        return f"Stored and indexed in BYB Shared Memory, but read-back verification failed (id={capture_id}). Do not rely on this memory yet."
+    return f"Stored raw capture in BYB Shared Memory, but it is not searchable yet (id={capture_id})."
+
+
+@mcp.tool
+def byb_memory_get_capture(capture_id: int) -> str:
+    """Get a BYB Shared Memory capture by exact capture ID."""
+    r = httpx.get(
+        f"{MEMORY_API_URL}/v1/captures/{capture_id}",
         headers=_api_headers(),
         timeout=30.0,
     )
     r.raise_for_status()
-    out = r.json()
-    return f"Captured (id={out.get('id', '?')})"
+    return str(r.json())
+
+
+@mcp.tool
+def byb_memory_get_tasks(
+    project_slug: Optional[str] = None,
+    status: Optional[str] = None,
+    include_complete: bool = True,
+    limit: int = 50,
+) -> str:
+    """List canonical BYB Shared Memory tasks."""
+    params = {"include_complete": include_complete, "limit": limit}
+    if project_slug:
+        params["project_slug"] = project_slug
+    if status:
+        params["status"] = status
+    r = httpx.get(f"{MEMORY_API_URL}/v1/tasks", params=params, headers=_api_headers(), timeout=30.0)
+    r.raise_for_status()
+    return str(r.json())
+
+
+@mcp.tool
+def byb_memory_get_projects() -> str:
+    """List canonical BYB Shared Memory projects."""
+    r = httpx.get(f"{MEMORY_API_URL}/v1/projects", headers=_api_headers(), timeout=30.0)
+    r.raise_for_status()
+    return str(r.json())
+
+
+@mcp.tool
+def byb_memory_patch_task(task_id: int, status: str) -> str:
+    """Patch a canonical BYB Shared Memory task status."""
+    return set_task_status(task_id=task_id, status=status)
+
+
+@mcp.tool
+def byb_memory_audit(limit: int = 20) -> str:
+    """Return lightweight BYB Shared Memory health and recent capture audit data."""
+    health = httpx.get(f"{MEMORY_API_URL}/health", headers=_api_headers(), timeout=30.0)
+    health.raise_for_status()
+    recent = httpx.get(
+        f"{MEMORY_API_URL}/v1/search",
+        params={"q": "", "limit": max(1, min(limit, 50))},
+        headers=_api_headers(),
+        timeout=30.0,
+    )
+    recent.raise_for_status()
+    return str({"health": health.json(), "recent": recent.json()})
 
 
 @mcp.tool
