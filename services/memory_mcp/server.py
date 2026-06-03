@@ -48,7 +48,7 @@ def search_memory(
     data = r.json()
     if isinstance(data, list):
         return "\n".join(
-            f"- [{c.get('created_at', '')}] {c.get('raw_content', '')}"
+            f"- [{c.get('created_at', '')}] source={c.get('source', 'unknown')} {c.get('raw_content', '')}"
             for c in data
         )
     return str(data)

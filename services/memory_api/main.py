@@ -391,8 +391,22 @@ def search_memory(
     )
     results = session.exec(stmt).all()
     
-    # 3. Format back as capture-style response for compatibility
-    return [{"raw_content": c.content, "created_at": c.created_at, "id": c.capture_id} for c in results]
+    # 3. Format back as capture-style response for compatibility. Preserve
+    # provenance from the linked Capture; older rows may still have "unknown".
+    capture_ids = {c.capture_id for c in results if c.capture_id}
+    captures_by_id = {}
+    if capture_ids:
+        captures = session.exec(select(Capture).where(Capture.id.in_(capture_ids))).all()
+        captures_by_id = {capture.id: capture for capture in captures}
+    return [
+        {
+            "raw_content": c.content,
+            "created_at": c.created_at,
+            "id": c.capture_id,
+            "source": captures_by_id[c.capture_id].source if c.capture_id in captures_by_id else "unknown",
+        }
+        for c in results
+    ]
 
 
 # --- MCP Adapter Mount ---
