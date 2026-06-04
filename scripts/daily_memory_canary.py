@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ from sqlmodel import Session, select  # noqa: E402
 
 from db.engine import engine  # noqa: E402
 from db.schema import Capture, Chunk, MemoryFactCard  # noqa: E402
-from services.memory_api.main import MEMORY_SYSTEM, app, search_memory_records  # noqa: E402
+from services.memory_api.main import MEMORY_SYSTEM, app, search_memory_records, service_metadata  # noqa: E402
 
 
 DEFAULT_ARTIFACT_DIR = Path("/root/byb-memory-backfill-20260604T001145Z")
@@ -40,6 +41,28 @@ KNOWN_FACTS = [
     "August 10",
 ]
 DEFAULT_EXCLUDED_VISIBILITIES = {"automation_heartbeat", "operational_audit"}
+
+
+def git_value(*args: str) -> str | None:
+    try:
+        return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return None
+
+
+def service_health() -> dict[str, Any]:
+    metadata = service_metadata()
+    return {
+        "status": metadata.get("status"),
+        "service": metadata.get("service"),
+        "canonical_memory": metadata.get("canonical_memory"),
+        "hybrid_search_enabled": metadata.get("hybrid_search_enabled"),
+        "sync_capture_enabled": metadata.get("sync_capture_enabled"),
+        "write_verify_enabled": metadata.get("write_verify_enabled"),
+        "git_sha": metadata.get("git_sha"),
+        "git_branch": metadata.get("git_branch"),
+        "dirty_worktree": metadata.get("dirty_worktree"),
+    }
 
 
 def visibility_counts(session: Session) -> dict[str, int]:
@@ -197,9 +220,11 @@ def main() -> None:
     index_health = run_index_health(args.user_id, args.artifact_dir)
 
     external_gates = {
-        "spike_trace_confirmation": "manual_required",
+        "spike_trace_result": "manual_required",
         "cortex_ui_confirmation": "manual_required",
     }
+    health = service_health()
+    commit_sha = git_value("rev-parse", "HEAD")
     passed = (
         sync["passed"]
         and known["passed"]
@@ -207,10 +232,13 @@ def main() -> None:
         and visibility["explicit_heartbeat_retrieves_automation"]
         and visibility["explicit_operational_retrieves_audit"]
         and index_health["unindexed_captures"] == 0
+        and health["status"] == "ok"
     )
     result = {
         "checked_at": datetime.now(timezone.utc).isoformat(),
+        "commit_sha": commit_sha,
         "memory_system": MEMORY_SYSTEM,
+        "service_health": health,
         "status": "pass" if passed else "needs_review",
         "sync_canary": sync,
         "known_facts": known,
