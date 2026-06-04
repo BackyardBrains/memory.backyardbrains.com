@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from sqlalchemy import or_, text
 
 from db.engine import engine, init_db
-from db.schema import Capture, Chunk, Event, Link, Person, Project, Task
+from db.schema import Capture, Chunk, Event, Link, MemoryFactCard, Person, Project, Task
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from packages.memory_retrieval.indexer import process_capture
@@ -26,6 +26,14 @@ mcp_app = mcp.http_app(path="/")
 class CaptureBody(BaseModel):
     raw_content: str
     source: str = "unknown"
+    source_system: str | None = None
+    source_path: str | None = None
+    source_type: str | None = None
+    observed_at: datetime | None = None
+    imported_at: datetime | None = None
+    content_hash: str | None = None
+    import_batch_id: str | None = None
+    historical_until_verified: bool = False
 
 
 class TaskBody(BaseModel):
@@ -76,6 +84,13 @@ MEMORY_SYSTEM = "BYB Shared Memory"
 LONG_NUMBER_RE = re.compile(r"\b\d{6,}\b")
 URL_RE = re.compile(r"https?://\S+")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_:\-./@]{5,}$")
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@'-]{1,}")
+OPERATIONAL_RECALL_VISIBILITIES = {"automation_heartbeat", "operational_audit"}
+OPERATIONAL_QUERY_RE = re.compile(
+    r"\b(agent operations?|cron|health checks?|heartbeat|midday pulse|business hours sync|"
+    r"night watch|morning briefing|afternoon wrap|memory infrastructure|operational audit)\b",
+    re.IGNORECASE,
+)
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE)),
     ("api_key", re.compile(r"\b(?:sk|pk|rk|pat|ghp|gho|ghu|ghs)_[A-Za-z0-9_\-]{16,}\b")),
@@ -420,7 +435,19 @@ def create_capture(
         raise HTTPException(status_code=422, detail={"message": "Capture rejected", "reason": reason})
 
     safe_content = redact_secrets(body.raw_content)
-    capture = Capture(raw_content=safe_content, source=body.source, user_id=user_id)
+    capture = Capture(
+        raw_content=safe_content,
+        source=body.source,
+        user_id=user_id,
+        source_system=body.source_system,
+        source_path=body.source_path,
+        source_type=body.source_type,
+        observed_at=body.observed_at,
+        imported_at=body.imported_at,
+        content_hash=body.content_hash,
+        import_batch_id=body.import_batch_id,
+        historical_until_verified=body.historical_until_verified,
+    )
     session.add(capture)
     session.commit()
     session.refresh(capture)
@@ -606,11 +633,63 @@ def _format_result(
         "content": chunk.content if chunk else capture.raw_content,
         "created_at": capture.created_at,
         "source": capture.source,
+        "source_system": capture.source_system,
+        "source_path": capture.source_path,
+        "source_type": capture.source_type,
+        "observed_at": capture.observed_at,
+        "imported_at": capture.imported_at,
+        "content_hash": capture.content_hash,
+        "import_batch_id": capture.import_batch_id,
+        "historical_until_verified": capture.historical_until_verified,
         "match_type": match_type,
         "rank_reason": rank_reason,
         "score": score,
         "memory_system": MEMORY_SYSTEM,
     }
+
+
+def _format_card_result(
+    card: MemoryFactCard,
+    capture: Capture,
+    *,
+    match_type: str,
+    rank_reason: str,
+    score: float,
+) -> dict:
+    return {
+        "id": capture.id,
+        "capture_id": capture.id,
+        "chunk_id": None,
+        "card_id": card.id,
+        "raw_content": capture.raw_content,
+        "content": card.content,
+        "created_at": capture.created_at,
+        "source": capture.source,
+        "source_system": card.source_system or capture.source_system,
+        "source_path": card.source_path or capture.source_path,
+        "source_type": card.source_type or capture.source_type,
+        "observed_at": card.observed_at or capture.observed_at,
+        "imported_at": capture.imported_at,
+        "content_hash": capture.content_hash,
+        "import_batch_id": capture.import_batch_id,
+        "historical_until_verified": capture.historical_until_verified,
+        "source_capture_id": card.source_capture_id,
+        "project_slug": card.project_slug,
+        "historical_status": card.historical_status,
+        "memory_visibility": card.memory_visibility or "historical_evidence",
+        "match_type": match_type,
+        "rank_reason": rank_reason,
+        "score": score,
+        "memory_system": MEMORY_SYSTEM,
+    }
+
+
+def _captures_for_cards(session: Session, cards: list[MemoryFactCard], user_id: str) -> dict[int, Capture]:
+    capture_ids = {card.source_capture_id for card in cards if card.source_capture_id}
+    if not capture_ids:
+        return {}
+    captures = session.exec(select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id)).all()
+    return {capture.id: capture for capture in captures if capture.id is not None}
 
 
 def _capture_project_filter(stmt, project_slug: str | None, session: Session):
@@ -624,6 +703,155 @@ def _capture_project_filter(stmt, project_slug: str | None, session: Session):
     return stmt.where(or_(*filters))
 
 
+def _query_requests_operational_memory(q: str) -> bool:
+    return bool(OPERATIONAL_QUERY_RE.search(q or ""))
+
+
+def _excluded_memory_visibilities(include_operational: bool) -> set[str]:
+    return set() if include_operational else OPERATIONAL_RECALL_VISIBILITIES
+
+
+def _card_visibility_filter(stmt, include_operational: bool):
+    excluded = _excluded_memory_visibilities(include_operational)
+    if not excluded:
+        return stmt
+    return stmt.where(
+        or_(
+            MemoryFactCard.memory_visibility.is_(None),
+            MemoryFactCard.memory_visibility.notin_(excluded),
+        )
+    )
+
+
+def _excluded_capture_ids_stmt(include_operational: bool):
+    excluded = _excluded_memory_visibilities(include_operational)
+    if not excluded:
+        return None
+    return select(MemoryFactCard.source_capture_id).where(MemoryFactCard.memory_visibility.in_(excluded))
+
+
+def _capture_visibility_filter(stmt, include_operational: bool):
+    excluded_capture_ids = _excluded_capture_ids_stmt(include_operational)
+    if excluded_capture_ids is None:
+        return stmt
+    return stmt.where(~Capture.id.in_(excluded_capture_ids))
+
+
+def _chunk_visibility_filter(stmt, include_operational: bool):
+    excluded_capture_ids = _excluded_capture_ids_stmt(include_operational)
+    if excluded_capture_ids is None:
+        return stmt
+    return stmt.where(or_(Chunk.capture_id.is_(None), ~Chunk.capture_id.in_(excluded_capture_ids)))
+
+
+def _card_project_filter(stmt, project_slug: str | None, include_operational: bool = False):
+    stmt = _card_visibility_filter(stmt, include_operational)
+    if not project_slug:
+        return stmt
+    return stmt.where(MemoryFactCard.project_slug == project_slug)
+
+
+def _query_aliases(q: str) -> set[str]:
+    query = (q or "").strip()
+    if not query:
+        return set()
+    aliases = {query.lower()}
+    if len(query.split()) > 2:
+        return aliases
+    aliases.update(match.group(0).lower() for match in URL_RE.finditer(query))
+    aliases.update(match.group(0).lower() for match in LONG_NUMBER_RE.finditer(query))
+    return aliases
+
+
+def _lexical_tokens(value: str) -> list[str]:
+    return [token.lower().strip(".,;:)]}\"'") for token in TOKEN_RE.findall(value or "") if len(token.strip(".,;:)]}\"'")) >= 3]
+
+
+def _rare_token_score(query_tokens: list[str], text_value: str) -> float:
+    haystack = (text_value or "").lower()
+    score = 0.0
+    for token in query_tokens:
+        if token not in haystack:
+            continue
+        if URL_RE.fullmatch(token) or "/" in token or "." in token:
+            score += 8.0
+        elif LONG_NUMBER_RE.fullmatch(token):
+            score += 7.0
+        elif "-" in token or "_" in token:
+            score += 5.0
+        elif len(token) >= 12:
+            score += 4.0
+        elif token not in {"the", "and", "for", "from", "with", "that", "this", "now", "run", "check"}:
+            score += 1.0
+    return score
+
+
+def _rerank_card_results(q: str, cards: list[MemoryFactCard], limit: int) -> list[MemoryFactCard]:
+    query = (q or "").strip()
+    query_lower = query.lower()
+    query_tokens = _lexical_tokens(query)
+    scored: list[tuple[float, int, MemoryFactCard]] = []
+    for idx, card in enumerate(cards):
+        text_value = f"{card.content or ''}\n{card.aliases_text or ''}"
+        text_lower = text_value.lower()
+        aliases = [alias.strip().lower() for alias in (card.aliases_text or "").splitlines() if alias.strip()]
+        overlap = sum(1 for token in set(query_tokens) if token in text_lower)
+        coverage = overlap / max(len(set(query_tokens)), 1)
+        exact_phrase = 1.0 if query_lower and query_lower in text_lower else 0.0
+        exact_alias = 1.0 if query_lower in aliases else 0.0
+        rare_score = _rare_token_score(query_tokens, text_value)
+        score = (
+            exact_alias * 10000.0
+            + exact_phrase * 5000.0
+            + coverage * 1000.0
+            + rare_score * 50.0
+            + (len(set(query_tokens)) if coverage >= 0.8 else 0.0)
+            - idx * 0.01
+        )
+        scored.append((score, idx, card))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [card for _score, _idx, card in scored[:limit]]
+
+
+def exact_card_alias_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
+    aliases = _query_aliases(q)
+    if not aliases:
+        return []
+    stmt = select(MemoryFactCard)
+    stmt = _card_project_filter(stmt, project_slug, include_operational)
+    stmt = stmt.where(or_(*[MemoryFactCard.aliases_text.ilike(f"%{alias}%") for alias in aliases]))
+    cards = list(session.exec(stmt.order_by(MemoryFactCard.observed_at.desc(), MemoryFactCard.id.desc()).limit(max(limit * 5, 50))).all())
+    exact_cards = [
+        card for card in cards
+        if any(alias == token.strip().lower() for alias in aliases for token in (card.aliases_text or "").splitlines())
+    ]
+    captures_by_id = _captures_for_cards(session, exact_cards, user_id)
+    results = []
+    for idx, card in enumerate(exact_cards):
+        capture = captures_by_id.get(card.source_capture_id)
+        if not capture:
+            continue
+        results.append(
+            _format_card_result(
+                card,
+                capture,
+                match_type="entity_alias",
+                rank_reason="exact entity/alias match on compact memory card",
+                score=1200.0 - idx,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _chunk_project_filter(stmt, project_slug: str | None, session: Session):
     project, project_tag = _project_match_conditions(project_slug, session)
     if not project_slug:
@@ -634,9 +862,109 @@ def _chunk_project_filter(stmt, project_slug: str | None, session: Session):
     return stmt.where(or_(*filters))
 
 
-def exact_capture_search(q: str, limit: int, project_slug: str | None, session: Session, user_id: str) -> list[dict]:
+def lexical_card_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
+    candidate_limit = max(limit * 40, 250)
+    params = {"q": q, "limit": candidate_limit, "project_slug": project_slug}
+    project_sql = "AND project_slug = :project_slug" if project_slug else ""
+    visibility_sql = "" if include_operational else "AND (memory_visibility IS NULL OR memory_visibility NOT IN ('automation_heartbeat', 'operational_audit'))"
+    sql = text(
+        f"""
+        SELECT id
+        FROM memoryfactcard
+        WHERE 1=1
+          {project_sql}
+          {visibility_sql}
+          AND (
+            to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(aliases_text, '')) @@ plainto_tsquery('simple', :q)
+            OR similarity(coalesce(content, '') || ' ' || coalesce(aliases_text, ''), :q) > 0.08
+            OR aliases_text ILIKE '%' || :q || '%'
+          )
+        ORDER BY
+          CASE WHEN aliases_text ILIKE '%' || :q || '%' THEN 1 ELSE 0 END DESC,
+          ts_rank(to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(aliases_text, '')), plainto_tsquery('simple', :q)) DESC,
+          similarity(coalesce(content, '') || ' ' || coalesce(aliases_text, ''), :q) DESC,
+          observed_at DESC NULLS LAST,
+          id DESC
+        LIMIT :limit
+        """
+    )
+    try:
+        rows = session.execute(sql, params).fetchall()
+        card_ids = [row[0] for row in rows]
+    except Exception:
+        session.rollback()
+        words = [word for word in re.findall(r"[A-Za-z0-9_\-./:]{3,}", q) if len(word) >= 3]
+        stmt = select(MemoryFactCard)
+        stmt = _card_project_filter(stmt, project_slug, include_operational)
+        if words:
+            stmt = stmt.where(or_(*[MemoryFactCard.content.ilike(f"%{word}%") for word in words[:6]]))
+        else:
+            stmt = stmt.where(MemoryFactCard.content.ilike(f"%{q}%"))
+        card_ids = [card.id for card in session.exec(stmt.order_by(MemoryFactCard.observed_at.desc()).limit(candidate_limit)).all() if card.id]
+    if not card_ids:
+        return []
+    cards = session.exec(select(MemoryFactCard).where(MemoryFactCard.id.in_(card_ids))).all()
+    cards_by_id = {card.id: card for card in cards}
+    ordered_cards = [cards_by_id[card_id] for card_id in card_ids if card_id in cards_by_id]
+    ordered_cards = _rerank_card_results(q, ordered_cards, limit)
+    captures_by_id = _captures_for_cards(session, ordered_cards, user_id)
+    return [
+        _format_card_result(
+            card,
+            captures_by_id[card.source_capture_id],
+            match_type="card_lexical",
+            rank_reason="compact memory-card lexical match",
+            score=900.0 - idx,
+        )
+        for idx, card in enumerate(ordered_cards)
+        if card.source_capture_id in captures_by_id
+    ]
+
+
+def semantic_card_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
+    query_vector = compute_embedding(q)
+    stmt = select(MemoryFactCard)
+    stmt = _card_project_filter(stmt, project_slug, include_operational)
+    cards = list(session.exec(stmt.order_by(MemoryFactCard.embedding.cosine_distance(query_vector)).limit(limit)).all())
+    captures_by_id = _captures_for_cards(session, cards, user_id)
+    return [
+        _format_card_result(
+            card,
+            captures_by_id[card.source_capture_id],
+            match_type="card_semantic",
+            rank_reason="compact memory-card vector similarity",
+            score=700.0 - idx,
+        )
+        for idx, card in enumerate(cards)
+        if card.source_capture_id in captures_by_id
+    ]
+
+
+def exact_capture_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
     stmt = select(Capture).where(Capture.user_id == user_id, Capture.raw_content.ilike(f"%{q}%"))
     stmt = _capture_project_filter(stmt, project_slug, session)
+    stmt = _capture_visibility_filter(stmt, include_operational)
     captures = list(session.exec(stmt.order_by(Capture.created_at.desc()).limit(limit)).all())
     chunks_by_capture = _chunk_by_capture(session, {c.id for c in captures if c.id}, user_id)
     reason = "substring match on identifier" if is_identifier_query(q) else "substring match"
@@ -647,7 +975,14 @@ def exact_capture_search(q: str, limit: int, project_slug: str | None, session: 
     ]
 
 
-def lexical_capture_search(q: str, limit: int, project_slug: str | None, session: Session, user_id: str) -> list[dict]:
+def lexical_capture_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
     params = {"q": q, "user_id": user_id, "limit": limit, "project_tag": f"%[project: {project_slug}]%" if project_slug else None}
     project, _ = _project_match_conditions(project_slug, session)
     params["project_id"] = project.id if project else None
@@ -661,12 +996,22 @@ def lexical_capture_search(q: str, limit: int, project_slug: str | None, session
             ))
           )
         """
+    visibility_sql = ""
+    if not include_operational:
+        visibility_sql = """
+          AND NOT EXISTS (
+            SELECT 1 FROM memoryfactcard mfc
+            WHERE mfc.source_capture_id = c.id
+              AND mfc.memory_visibility IN ('automation_heartbeat', 'operational_audit')
+          )
+        """
     sql = text(
         f"""
         SELECT c.id
         FROM capture c
         WHERE c.user_id = :user_id
           {project_sql}
+          {visibility_sql}
           AND (
             to_tsvector('simple', coalesce(c.raw_content, '')) @@ plainto_tsquery('simple', :q)
             OR similarity(c.raw_content, :q) > 0.08
@@ -690,6 +1035,7 @@ def lexical_capture_search(q: str, limit: int, project_slug: str | None, session
         else:
             stmt = stmt.where(Capture.raw_content.ilike(f"%{q}%"))
         stmt = _capture_project_filter(stmt, project_slug, session)
+        stmt = _capture_visibility_filter(stmt, include_operational)
         capture_ids = [capture.id for capture in session.exec(stmt.order_by(Capture.created_at.desc()).limit(limit)).all() if capture.id]
 
     if not capture_ids:
@@ -710,10 +1056,18 @@ def lexical_capture_search(q: str, limit: int, project_slug: str | None, session
     ]
 
 
-def semantic_chunk_search(q: str, limit: int, project_slug: str | None, session: Session, user_id: str) -> list[dict]:
+def semantic_chunk_search(
+    q: str,
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
     query_vector = compute_embedding(q)
     stmt = select(Chunk).where(Chunk.user_id == user_id)
     stmt = _chunk_project_filter(stmt, project_slug, session)
+    stmt = _chunk_visibility_filter(stmt, include_operational)
     chunks = list(session.exec(stmt.order_by(Chunk.embedding.cosine_distance(query_vector)).limit(limit)).all())
     capture_ids = {chunk.capture_id for chunk in chunks if chunk.capture_id}
     captures_by_id = {}
@@ -754,9 +1108,16 @@ def merge_search_results(groups: list[list[dict]], limit: int) -> list[dict]:
     return merged
 
 
-def recent_capture_records(limit: int, project_slug: str | None, session: Session, user_id: str) -> list[dict]:
+def recent_capture_records(
+    limit: int,
+    project_slug: str | None,
+    session: Session,
+    user_id: str,
+    include_operational: bool = False,
+) -> list[dict]:
     stmt = select(Capture).where(Capture.user_id == user_id)
     stmt = _capture_project_filter(stmt, project_slug, session)
+    stmt = _capture_visibility_filter(stmt, include_operational)
     captures = list(session.exec(stmt.order_by(Capture.created_at.desc()).limit(limit)).all())
     chunks_by_capture = _chunk_by_capture(session, {c.id for c in captures if c.id}, user_id)
     return [
@@ -773,24 +1134,31 @@ def search_memory_records(
     session: Session,
     user_id: str,
     include_semantic: bool = True,
+    include_operational: bool | None = None,
 ) -> list[dict]:
     bounded_limit = max(1, min(int(limit), 200))
     query = (q or "").strip()
+    include_operational = _query_requests_operational_memory(query) if include_operational is None else include_operational
     if not query:
-        return recent_capture_records(bounded_limit, project_slug, session, user_id)
+        return recent_capture_records(bounded_limit, project_slug, session, user_id, include_operational)
 
-    exact = exact_capture_search(query, bounded_limit, project_slug, session, user_id)
-    lexical = lexical_capture_search(query, bounded_limit, project_slug, session, user_id)
+    exact = exact_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+    card_exact = exact_card_alias_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+    card_lexical = lexical_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+    card_semantic = []
+    lexical = lexical_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
     semantic = []
     if include_semantic:
         try:
-            semantic = semantic_chunk_search(query, bounded_limit, project_slug, session, user_id)
+            card_semantic = semantic_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+            semantic = semantic_chunk_search(query, bounded_limit, project_slug, session, user_id, include_operational)
         except Exception:
             session.rollback()
+            card_semantic = []
             semantic = []
     if is_identifier_query(query):
-        return merge_search_results([exact, lexical, semantic], bounded_limit)
-    return merge_search_results([exact, lexical, semantic], bounded_limit)
+        return merge_search_results([card_exact, exact, card_lexical, card_semantic, lexical, semantic], bounded_limit)
+    return merge_search_results([card_exact, card_lexical, card_semantic, exact, lexical, semantic], bounded_limit)
 
 
 @app.get("/v1/search")
@@ -798,11 +1166,19 @@ def search_memory(
     q: str = "",
     limit: int = 10,
     project_slug: str | None = None,
+    include_operational: bool = False,
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
 ):
     """Hybrid exact, lexical, then semantic search."""
-    return search_memory_records(q=q, limit=limit, project_slug=project_slug, session=session, user_id=user_id)
+    return search_memory_records(
+        q=q,
+        limit=limit,
+        project_slug=project_slug,
+        session=session,
+        user_id=user_id,
+        include_operational=True if include_operational else None,
+    )
 
 
 # --- MCP Adapter Mount ---

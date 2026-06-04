@@ -89,6 +89,14 @@ class Capture(SQLModel, table=True):
     source: str  # e.g., "claude-ios", "watson-cron", "slack"
     user_id: str = Field(index=True)  # Maps to the API Key used (e.g., "greg")
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    source_system: Optional[str] = Field(default=None, index=True)
+    source_path: Optional[str] = Field(default=None, index=True)
+    source_type: Optional[str] = None
+    observed_at: Optional[datetime] = Field(default=None, index=True)
+    imported_at: Optional[datetime] = Field(default=None, index=True)
+    content_hash: Optional[str] = Field(default=None, index=True)
+    import_batch_id: Optional[str] = Field(default=None, index=True)
+    historical_until_verified: bool = Field(default=False, index=True)
 
     chunks: List["Chunk"] = Relationship(back_populates="capture")
 
@@ -116,3 +124,27 @@ class Chunk(SQLModel, table=True):
 
     capture_id: Optional[int] = Field(default=None, foreign_key="capture.id")
     capture: Optional[Capture] = Relationship(back_populates="chunks")
+
+
+class MemoryFactCard(SQLModel, table=True):
+    """Compact retrieval card derived from a raw capture.
+
+    Raw captures remain the evidence layer; these cards are the primary retrieval
+    layer for historical memories.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    source_capture_id: int = Field(foreign_key="capture.id", index=True)
+    content: str
+    aliases_json: Optional[str] = None
+    aliases_text: Optional[str] = Field(default=None, index=True)
+    entities_json: Optional[str] = None
+    project_slug: Optional[str] = Field(default=None, index=True)
+    source_system: Optional[str] = Field(default=None, index=True)
+    source_type: Optional[str] = None
+    source_path: Optional[str] = Field(default=None, index=True)
+    observed_at: Optional[datetime] = Field(default=None, index=True)
+    historical_status: Optional[str] = Field(default=None, index=True)
+    memory_visibility: Optional[str] = Field(default="historical_evidence", index=True)
+    provenance_json: Optional[str] = None
+    embedding: List[float] = Field(sa_column=Column(Vector(VECTOR_DIM)))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
