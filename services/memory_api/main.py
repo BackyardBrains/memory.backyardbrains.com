@@ -9,8 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
+<<<<<<< HEAD
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
+=======
+from fastapi import Depends, FastAPI, HTTPException, Header, status, BackgroundTasks
+from pydantic import BaseModel, field_validator
+>>>>>>> 2852dbe3669bbeb314cd86f160e53bfcafa1bf35
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
 
@@ -37,6 +42,7 @@ class CaptureBody(BaseModel):
     historical_until_verified: bool = False
 
 
+<<<<<<< HEAD
 class CapturePatchBody(BaseModel):
     raw_content: str | None = None
     source: str | None = None
@@ -64,6 +70,24 @@ class CaptureDeleteBody(BaseModel):
     source_message_ids: list[str] | None = None
     idempotency_key: str | None = None
     expected_revision: int | None = None
+=======
+# Known Cortex task states; tolerant — any short string is accepted (no hard enum).
+KNOWN_TASK_STATES = {"ready", "decision", "deep", "plain"}
+MAX_TASK_STATE_LENGTH = 64
+
+
+def _validate_task_state(value: str | None) -> str | None:
+    if value is None:
+        return value
+    state = value.strip()
+    if not state:
+        return None
+    if state.lower() in KNOWN_TASK_STATES:
+        return state.lower()
+    if len(state) > MAX_TASK_STATE_LENGTH:
+        raise ValueError(f"state must be at most {MAX_TASK_STATE_LENGTH} characters")
+    return state
+>>>>>>> 2852dbe3669bbeb314cd86f160e53bfcafa1bf35
 
 
 class TaskBody(BaseModel):
@@ -72,10 +96,19 @@ class TaskBody(BaseModel):
     project_id: int | None = None
     due_date: str | None = None
     snooze_until: str | None = None
+    draft_text: str | None = None
+    state: str | None = None
+
+    _validate_state = field_validator("state")(_validate_task_state)
 
 
 class TaskStatusBody(BaseModel):
-    status: str
+    """PATCH body for tasks. All fields optional; only provided fields are updated."""
+    status: str | None = None
+    draft_text: str | None = None
+    state: str | None = None
+
+    _validate_state = field_validator("state")(_validate_task_state)
 
 
 class ProjectBody(BaseModel):
@@ -83,6 +116,19 @@ class ProjectBody(BaseModel):
     title: str
     status: str = "Active"
     priority: str = "Normal"
+    category: str | None = None
+    last_activity_at: datetime | None = None
+    waiting_on: str | None = None
+
+
+class ProjectPatchBody(BaseModel):
+    """PATCH body for projects. All fields optional; only provided fields are updated."""
+    title: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    category: str | None = None
+    last_activity_at: datetime | None = None
+    waiting_on: str | None = None
 
 
 class ProjectPatchBody(BaseModel):
@@ -129,6 +175,13 @@ URL_RE = re.compile(r"https?://\S+")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_:\-./@]{5,}$")
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@'-]{1,}")
 OPERATIONAL_RECALL_VISIBILITIES = {"automation_heartbeat", "operational_audit"}
+# Email index captures ("[email]...", "[email][waiting-on-greg]...", etc. or source
+# claude-desktop-1) are bulk mirrors of the inbox: keep them findable (dedup by
+# threadId relies on exact/lexical lookup) but demote them on the semantic path so
+# they don't crowd out organic memories of similar semantic score.
+EMAIL_INDEX_CONTENT_PREFIX = "[email]"
+EMAIL_INDEX_SOURCES = {"claude-desktop-1"}
+EMAIL_INDEX_DEMOTION_FACTOR = float(os.getenv("EMAIL_INDEX_DEMOTION_FACTOR", "0.65"))
 OPERATIONAL_QUERY_RE = re.compile(
     r"\b(agent operations?|cron|health checks?|heartbeat|midday pulse|business hours sync|"
     r"night watch|morning briefing|afternoon wrap|memory infrastructure|operational audit)\b",
@@ -491,7 +544,33 @@ def create_project(
     existing = session.exec(select(Project).where(Project.slug == body.slug)).first()
     if existing:
         raise HTTPException(status_code=409, detail=f"Project slug '{body.slug}' already exists")
-    proj = Project(slug=body.slug, title=body.title, status=body.status, priority=body.priority)
+    proj = Project(
+        slug=body.slug,
+        title=body.title,
+        status=body.status,
+        priority=body.priority,
+        category=body.category,
+        last_activity_at=body.last_activity_at,
+        waiting_on=body.waiting_on,
+    )
+    session.add(proj)
+    session.commit()
+    session.refresh(proj)
+    return proj
+
+
+@app.patch("/v1/projects/{slug}")
+def patch_project(
+    slug: str,
+    body: ProjectPatchBody,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    proj = session.exec(select(Project).where(Project.slug == slug)).first()
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(proj, field, value)
     session.add(proj)
     session.commit()
     session.refresh(proj)
@@ -1180,6 +1259,8 @@ def create_task(
         project_id=body.project_id,
         due_date=due_dt,
         snooze_until=snooze_dt,
+        draft_text=body.draft_text,
+        state=body.state,
     )
     session.add(task)
     session.commit()
@@ -1197,7 +1278,8 @@ def set_task_status(
     task = session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    task.status = body.status
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(task, field, value)
     session.add(task)
     session.commit()
     session.refresh(task)
@@ -1732,6 +1814,27 @@ def semantic_chunk_search(
     return results
 
 
+def _is_email_index_result(item: dict) -> bool:
+    raw_content = (item.get("raw_content") or "").lstrip()
+    return raw_content.startswith(EMAIL_INDEX_CONTENT_PREFIX) or item.get("source") in EMAIL_INDEX_SOURCES
+
+
+def demote_email_index_results(results: list[dict]) -> list[dict]:
+    """Demote email-index captures on the semantic path (never filters them out).
+
+    Exact/lexical matches (threadId dedup lookups, substring hits) are left alone.
+    """
+    demoted_any = False
+    for item in results:
+        if _is_email_index_result(item) and item.get("score", 0.0) > 0.0:
+            item["score"] = round(item["score"] * EMAIL_INDEX_DEMOTION_FACTOR, 4)
+            item["rank_reason"] = f"{item['rank_reason']}; demoted x{EMAIL_INDEX_DEMOTION_FACTOR} (email index capture)"
+            demoted_any = True
+    if demoted_any:
+        results.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return results
+
+
 def merge_search_results(groups: list[list[dict]], limit: int) -> list[dict]:
     merged: list[dict] = []
     seen: set[tuple[int | None, int | None]] = set()
@@ -1815,8 +1918,12 @@ def search_memory_records(
     semantic = []
     if include_semantic:
         try:
-            card_semantic = semantic_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-            semantic = semantic_chunk_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+            card_semantic = demote_email_index_results(
+                semantic_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+            )
+            semantic = demote_email_index_results(
+                semantic_chunk_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+            )
         except Exception:
             session.rollback()
             card_semantic = []
