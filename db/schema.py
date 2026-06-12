@@ -7,7 +7,7 @@ and an embeddings-backed Chunk table for semantic/fuzzy retrieval via pgvector.
 from typing import List, Optional
 from datetime import datetime
 from sqlmodel import Field, SQLModel, Relationship
-from sqlalchemy import Column
+from sqlalchemy import Column, Text
 from pgvector.sqlalchemy import Vector
 
 # Vector dimension: BAAI/bge-small-en-v1.5 and all-MiniLM-L6-v2 both output 384
@@ -23,7 +23,10 @@ class Project(SQLModel, table=True):
     title: str
     status: str = Field(default="Active")
     priority: str = Field(default="Normal")
-    
+    category: Optional[str] = None  # e.g., "neuro", "plant", "invertebrate", "human"
+    last_activity_at: Optional[datetime] = None  # Last meaningful change (Watson steward)
+    waiting_on: Optional[str] = None  # e.g., "greg" or "external:Moritz"
+
     # Relationships
     tasks: List["Task"] = Relationship(back_populates="project")
     chunks: List["Chunk"] = Relationship(back_populates="project")
@@ -34,7 +37,9 @@ class Task(SQLModel, table=True):
     status: str = Field(default="To Do") # To Do, In Progress, Complete, Deferred
     snooze_until: Optional[datetime] = None # For delayed/snoozed tasks
     due_date: Optional[datetime] = None
-    
+    draft_text: Optional[str] = Field(default=None, sa_column=Column(Text))  # Prepared email/reply body (Watson)
+    state: Optional[str] = None  # Cortex triage state: "ready", "decision", "deep", "plain" (tolerant)
+
     project_id: Optional[int] = Field(default=None, foreign_key="project.id")
     project: Optional[Project] = Relationship(back_populates="tasks")
     
