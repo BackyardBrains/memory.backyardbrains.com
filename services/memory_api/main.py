@@ -114,19 +114,18 @@ class ProjectBody(BaseModel):
 
 
 class ProjectPatchBody(BaseModel):
-    """PATCH body for projects. All fields optional; only provided fields are updated."""
+    """PATCH body for projects. All fields optional; only provided fields are updated.
+
+    title/status/priority are audited core fields and require revision_reason.
+    category/last_activity_at/waiting_on are Cortex board metadata and may be
+    patched without an explicit reason.
+    """
     title: str | None = None
     status: str | None = None
     priority: str | None = None
     category: str | None = None
     last_activity_at: datetime | None = None
     waiting_on: str | None = None
-
-
-class ProjectPatchBody(BaseModel):
-    title: str | None = None
-    status: str | None = None
-    priority: str | None = None
     revision_reason: str | None = None
     revision_actor: str | None = None
     source_message_ids: list[str] | None = None
@@ -369,7 +368,7 @@ CARD_REVISION_FIELDS = (
     "provenance_json",
     "created_at",
 )
-PROJECT_REVISION_FIELDS = ("slug", "title", "status", "priority")
+PROJECT_REVISION_FIELDS = ("slug", "title", "status", "priority", "category", "last_activity_at", "waiting_on")
 
 
 def revision_snapshot(record, fields: tuple[str, ...]) -> dict:
@@ -558,24 +557,6 @@ def patch_project(
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
 ):
-    proj = session.exec(select(Project).where(Project.slug == slug)).first()
-    if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
-    for field, value in body.model_dump(exclude_unset=True).items():
-        setattr(proj, field, value)
-    session.add(proj)
-    session.commit()
-    session.refresh(proj)
-    return proj
-
-
-@app.patch("/v1/projects/{slug}")
-def patch_project(
-    slug: str,
-    body: ProjectPatchBody,
-    session: Session = Depends(get_db_session),
-    user_id: str = Depends(get_user_from_api_key),
-):
     """Update a structured project row with an audit revision."""
     project = session.exec(select(Project).where(Project.slug == slug)).first()
     if not project:
@@ -595,10 +576,15 @@ def patch_project(
 
     incoming = body.model_dump(exclude_unset=True)
     patch_values = {key: value for key, value in incoming.items() if key in {"title", "status", "priority"}}
-    if not patch_values:
+    board_values = {key: value for key, value in incoming.items() if key in {"category", "last_activity_at", "waiting_on"}}
+    if not patch_values and not board_values:
         raise HTTPException(status_code=422, detail="At least one mutable project field is required")
 
-    reason = _require_reason(body.revision_reason)
+    if patch_values:
+        reason = _require_reason(body.revision_reason)
+    else:
+        # Board metadata (category/last_activity_at/waiting_on) may be patched without a reason.
+        reason = (body.revision_reason or "").strip() or "cortex board metadata update"
     actor = (body.revision_actor or user_id).strip() or user_id
     before = revision_snapshot(project, PROJECT_REVISION_FIELDS)
 
@@ -606,6 +592,10 @@ def patch_project(
         if value is None or not str(value).strip():
             raise HTTPException(status_code=422, detail=f"{field} cannot be blank")
         setattr(project, field, str(value).strip())
+
+    for field, value in board_values.items():
+        # None is allowed: clearing waiting_on/category is meaningful.
+        setattr(project, field, value)
 
     after = revision_snapshot(project, PROJECT_REVISION_FIELDS)
     if before == after:
