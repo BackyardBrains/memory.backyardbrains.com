@@ -9,13 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-<<<<<<< HEAD
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel
-=======
-from fastapi import Depends, FastAPI, HTTPException, Header, status, BackgroundTasks
 from pydantic import BaseModel, field_validator
->>>>>>> 2852dbe3669bbeb314cd86f160e53bfcafa1bf35
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
 
@@ -42,7 +37,6 @@ class CaptureBody(BaseModel):
     historical_until_verified: bool = False
 
 
-<<<<<<< HEAD
 class CapturePatchBody(BaseModel):
     raw_content: str | None = None
     source: str | None = None
@@ -70,7 +64,6 @@ class CaptureDeleteBody(BaseModel):
     source_message_ids: list[str] | None = None
     idempotency_key: str | None = None
     expected_revision: int | None = None
-=======
 # Known Cortex task states; tolerant — any short string is accepted (no hard enum).
 KNOWN_TASK_STATES = {"ready", "decision", "deep", "plain"}
 MAX_TASK_STATE_LENGTH = 64
@@ -87,7 +80,6 @@ def _validate_task_state(value: str | None) -> str | None:
     if len(state) > MAX_TASK_STATE_LENGTH:
         raise ValueError(f"state must be at most {MAX_TASK_STATE_LENGTH} characters")
     return state
->>>>>>> 2852dbe3669bbeb314cd86f160e53bfcafa1bf35
 
 
 class TaskBody(BaseModel):
