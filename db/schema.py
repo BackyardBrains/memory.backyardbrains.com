@@ -89,6 +89,14 @@ class Capture(SQLModel, table=True):
     source: str  # e.g., "claude-ios", "watson-cron", "slack"
     user_id: str = Field(index=True)  # Maps to the API Key used (e.g., "greg")
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime] = Field(default=None, index=True)
+    memory_status: str = Field(default="active", index=True)
+    revision: int = Field(default=1, index=True)
+    superseded_by_capture_id: Optional[int] = Field(default=None, foreign_key="capture.id", index=True)
+    deleted_at: Optional[datetime] = Field(default=None, index=True)
+    revision_reason: Optional[str] = None
+    revision_actor: Optional[str] = Field(default=None, index=True)
+    revision_source_ids_json: Optional[str] = None
     source_system: Optional[str] = Field(default=None, index=True)
     source_path: Optional[str] = Field(default=None, index=True)
     source_type: Optional[str] = None
@@ -145,6 +153,30 @@ class MemoryFactCard(SQLModel, table=True):
     observed_at: Optional[datetime] = Field(default=None, index=True)
     historical_status: Optional[str] = Field(default=None, index=True)
     memory_visibility: Optional[str] = Field(default="historical_evidence", index=True)
+    memory_status: str = Field(default="active", index=True)
+    revision: int = Field(default=1, index=True)
+    superseded_by_card_id: Optional[int] = Field(default=None, index=True)
+    updated_at: Optional[datetime] = Field(default=None, index=True)
+    deleted_at: Optional[datetime] = Field(default=None, index=True)
+    revision_reason: Optional[str] = None
+    revision_actor: Optional[str] = Field(default=None, index=True)
+    revision_source_ids_json: Optional[str] = None
     provenance_json: Optional[str] = None
     embedding: List[float] = Field(sa_column=Column(Vector(VECTOR_DIM)))
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class MemoryRevision(SQLModel, table=True):
+    """Append-only audit history for capture and fact-card corrections."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    target_type: str = Field(index=True)  # capture, memory_fact_card
+    target_id: int = Field(index=True)
+    user_id: str = Field(index=True)
+    action: str = Field(index=True)  # update, delete, derived_status
+    before_json: Optional[str] = None
+    after_json: Optional[str] = None
+    reason: Optional[str] = None
+    actor: Optional[str] = Field(default=None, index=True)
+    source_ids_json: Optional[str] = None
+    idempotency_key: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)

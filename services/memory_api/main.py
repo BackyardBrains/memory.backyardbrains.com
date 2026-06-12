@@ -1,5 +1,6 @@
 """Memory API: versioned HTTP/JSON domain API with API Key authentication."""
 
+import json
 import os
 import re
 import subprocess
@@ -8,16 +9,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Header, status, BackgroundTasks
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
 
 from db.engine import engine, init_db
-from db.schema import Capture, Chunk, Event, Link, MemoryFactCard, Person, Project, Task
+from db.schema import Capture, Chunk, Event, Link, MemoryFactCard, MemoryRevision, Person, Project, Task
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from packages.memory_retrieval.indexer import process_capture
+from packages.memory_retrieval.indexer import process_capture, upsert_capture_chunk
 from packages.memory_retrieval.embeddings import compute_embedding
 
 from services.memory_mcp.server import mcp
@@ -34,6 +35,35 @@ class CaptureBody(BaseModel):
     content_hash: str | None = None
     import_batch_id: str | None = None
     historical_until_verified: bool = False
+
+
+class CapturePatchBody(BaseModel):
+    raw_content: str | None = None
+    source: str | None = None
+    source_system: str | None = None
+    source_path: str | None = None
+    source_type: str | None = None
+    observed_at: datetime | None = None
+    imported_at: datetime | None = None
+    content_hash: str | None = None
+    import_batch_id: str | None = None
+    historical_until_verified: bool | None = None
+    memory_status: str | None = None
+    superseded_by_capture_id: int | None = None
+    revision_reason: str | None = None
+    revision_actor: str | None = None
+    source_message_ids: list[str] | None = None
+    idempotency_key: str | None = None
+    expected_revision: int | None = None
+    reindex: bool = True
+
+
+class CaptureDeleteBody(BaseModel):
+    reason: str | None = None
+    actor: str | None = None
+    source_message_ids: list[str] | None = None
+    idempotency_key: str | None = None
+    expected_revision: int | None = None
 
 
 class TaskBody(BaseModel):
@@ -53,6 +83,16 @@ class ProjectBody(BaseModel):
     title: str
     status: str = "Active"
     priority: str = "Normal"
+
+
+class ProjectPatchBody(BaseModel):
+    title: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    revision_reason: str | None = None
+    revision_actor: str | None = None
+    source_message_ids: list[str] | None = None
+    idempotency_key: str | None = None
 
 
 class EventBody(BaseModel):
@@ -81,6 +121,9 @@ class LinkBody(BaseModel):
 API_KEY_PREFIX = "sk_byb_"
 SERVICE_ROOT = Path(__file__).resolve().parent.parent.parent
 MEMORY_SYSTEM = "BYB Shared Memory"
+ACTIVE_MEMORY_STATUS = "active"
+VALID_MEMORY_STATUSES = {"active", "superseded", "retracted", "duplicate", "stale", "deleted"}
+INACTIVE_MEMORY_STATUSES = VALID_MEMORY_STATUSES - {ACTIVE_MEMORY_STATUS}
 LONG_NUMBER_RE = re.compile(r"\b\d{6,}\b")
 URL_RE = re.compile(r"https?://\S+")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_:\-./@]{5,}$")
@@ -116,11 +159,12 @@ def service_metadata() -> dict:
         "git_branch": os.getenv("GIT_BRANCH") or _git_value("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty_worktree": dirty,
         "deployed_at": os.getenv("DEPLOYED_AT"),
-        "version": "2026.06.03-memory-stabilization",
+        "version": "2026.06.10-memory-corrections",
         "canonical_memory": MEMORY_SYSTEM,
         "hybrid_search_enabled": True,
         "sync_capture_enabled": True,
         "write_verify_enabled": True,
+        "memory_correction_enabled": True,
     }
 
 
@@ -194,6 +238,179 @@ def choose_verification_query(raw_content: str) -> str:
 def is_identifier_query(q: str) -> bool:
     query = (q or "").strip()
     return bool(LONG_NUMBER_RE.search(query) or IDENTIFIER_RE.match(query))
+
+
+def normalize_memory_status(value: str) -> str:
+    status_value = (value or "").strip().lower()
+    if status_value not in VALID_MEMORY_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Invalid memory_status",
+                "allowed": sorted(VALID_MEMORY_STATUSES),
+            },
+        )
+    return status_value
+
+
+def is_inactive_memory_status(value: str | None) -> bool:
+    return (value or ACTIVE_MEMORY_STATUS).strip().lower() in INACTIVE_MEMORY_STATUSES
+
+
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
+def _require_reason(reason: str | None) -> str:
+    clean_reason = (reason or "").strip()
+    if not clean_reason:
+        raise HTTPException(status_code=422, detail="revision_reason is required for memory updates/deletes")
+    return clean_reason
+
+
+def _json_default(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _json_dumps(value) -> str:
+    return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+CAPTURE_REVISION_FIELDS = (
+    "raw_content",
+    "source",
+    "user_id",
+    "created_at",
+    "updated_at",
+    "memory_status",
+    "revision",
+    "superseded_by_capture_id",
+    "deleted_at",
+    "revision_reason",
+    "revision_actor",
+    "revision_source_ids_json",
+    "source_system",
+    "source_path",
+    "source_type",
+    "observed_at",
+    "imported_at",
+    "content_hash",
+    "import_batch_id",
+    "historical_until_verified",
+)
+CARD_REVISION_FIELDS = (
+    "source_capture_id",
+    "content",
+    "aliases_json",
+    "aliases_text",
+    "entities_json",
+    "project_slug",
+    "source_system",
+    "source_type",
+    "source_path",
+    "observed_at",
+    "historical_status",
+    "memory_visibility",
+    "memory_status",
+    "revision",
+    "superseded_by_card_id",
+    "updated_at",
+    "deleted_at",
+    "revision_reason",
+    "revision_actor",
+    "revision_source_ids_json",
+    "provenance_json",
+    "created_at",
+)
+PROJECT_REVISION_FIELDS = ("slug", "title", "status", "priority")
+
+
+def revision_snapshot(record, fields: tuple[str, ...]) -> dict:
+    return {field: getattr(record, field, None) for field in fields}
+
+
+def _source_ids_json(source_message_ids: list[str] | None) -> str | None:
+    if not source_message_ids:
+        return None
+    return _json_dumps([str(item) for item in source_message_ids if str(item).strip()])
+
+
+def _existing_revision_for_key(
+    session: Session,
+    *,
+    target_type: str,
+    target_id: int,
+    user_id: str,
+    idempotency_key: str | None,
+) -> MemoryRevision | None:
+    if not idempotency_key:
+        return None
+    return session.exec(
+        select(MemoryRevision).where(
+            MemoryRevision.target_type == target_type,
+            MemoryRevision.target_id == target_id,
+            MemoryRevision.user_id == user_id,
+            MemoryRevision.idempotency_key == idempotency_key,
+        )
+    ).first()
+
+
+def _record_revision(
+    session: Session,
+    *,
+    target_type: str,
+    target_id: int,
+    user_id: str,
+    action: str,
+    before: dict,
+    after: dict,
+    reason: str,
+    actor: str,
+    source_message_ids: list[str] | None,
+    idempotency_key: str | None,
+) -> MemoryRevision:
+    revision = MemoryRevision(
+        target_type=target_type,
+        target_id=target_id,
+        user_id=user_id,
+        action=action,
+        before_json=_json_dumps(before),
+        after_json=_json_dumps(after),
+        reason=reason,
+        actor=actor,
+        source_ids_json=_source_ids_json(source_message_ids),
+        idempotency_key=idempotency_key,
+    )
+    session.add(revision)
+    return revision
+
+
+def _project_response(project: Project, *, action: str | None = None, revision_id: int | None = None, idempotent: bool = False) -> dict:
+    data = project.model_dump()
+    if action:
+        data["action"] = action
+    if revision_id is not None:
+        data["revision_id"] = revision_id
+    if idempotent:
+        data["idempotent"] = True
+    return data
+
+
+def _capture_response(capture: Capture, action: str, revision_id: int | None = None, idempotent: bool = False) -> dict:
+    data = capture.model_dump()
+    data.update(
+        {
+            "capture_id": capture.id,
+            "memory_id": capture.id,
+            "action": action,
+            "revision_id": revision_id,
+            "idempotent": idempotent,
+            "memory_system": MEMORY_SYSTEM,
+        }
+    )
+    return data
 
 
 def get_user_from_api_key(
@@ -279,6 +496,68 @@ def create_project(
     session.commit()
     session.refresh(proj)
     return proj
+
+
+@app.patch("/v1/projects/{slug}")
+def patch_project(
+    slug: str,
+    body: ProjectPatchBody,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    """Update a structured project row with an audit revision."""
+    project = session.exec(select(Project).where(Project.slug == slug)).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.id is None:
+        raise HTTPException(status_code=500, detail="Project row has no id")
+
+    existing_revision = _existing_revision_for_key(
+        session,
+        target_type="project",
+        target_id=project.id,
+        user_id=user_id,
+        idempotency_key=body.idempotency_key,
+    )
+    if existing_revision:
+        return _project_response(project, action="update", revision_id=existing_revision.id, idempotent=True)
+
+    incoming = body.model_dump(exclude_unset=True)
+    patch_values = {key: value for key, value in incoming.items() if key in {"title", "status", "priority"}}
+    if not patch_values:
+        raise HTTPException(status_code=422, detail="At least one mutable project field is required")
+
+    reason = _require_reason(body.revision_reason)
+    actor = (body.revision_actor or user_id).strip() or user_id
+    before = revision_snapshot(project, PROJECT_REVISION_FIELDS)
+
+    for field, value in patch_values.items():
+        if value is None or not str(value).strip():
+            raise HTTPException(status_code=422, detail=f"{field} cannot be blank")
+        setattr(project, field, str(value).strip())
+
+    after = revision_snapshot(project, PROJECT_REVISION_FIELDS)
+    if before == after:
+        return _project_response(project, action="update", idempotent=True)
+
+    session.add(project)
+    revision = _record_revision(
+        session,
+        target_type="project",
+        target_id=project.id,
+        user_id=user_id,
+        action="update",
+        before=before,
+        after=after,
+        reason=reason,
+        actor=actor,
+        source_message_ids=body.source_message_ids,
+        idempotency_key=body.idempotency_key,
+    )
+    session.commit()
+    session.refresh(project)
+    session.refresh(revision)
+    return _project_response(project, action="update", revision_id=revision.id)
 
 
 @app.get("/v1/tasks")
@@ -508,6 +787,333 @@ def get_capture(
     return data
 
 
+CAPTURE_PATCH_FIELDS = {
+    "raw_content",
+    "source",
+    "source_system",
+    "source_path",
+    "source_type",
+    "observed_at",
+    "imported_at",
+    "content_hash",
+    "import_batch_id",
+    "historical_until_verified",
+    "memory_status",
+    "superseded_by_capture_id",
+}
+
+
+def _get_owned_capture(session: Session, capture_id: int, user_id: str) -> Capture:
+    capture = session.get(Capture, capture_id)
+    if not capture or capture.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    return capture
+
+
+def _check_expected_revision(capture: Capture, expected_revision: int | None) -> None:
+    if expected_revision is not None and capture.revision != expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Capture revision conflict",
+                "expected_revision": expected_revision,
+                "current_revision": capture.revision,
+            },
+        )
+
+
+def _validate_supersession_target(
+    session: Session,
+    *,
+    capture: Capture,
+    superseded_by_capture_id: int | None,
+    user_id: str,
+) -> None:
+    if superseded_by_capture_id is None:
+        return
+    if superseded_by_capture_id == capture.id:
+        raise HTTPException(status_code=422, detail="A capture cannot supersede itself")
+    replacement = session.get(Capture, superseded_by_capture_id)
+    if not replacement or replacement.user_id != user_id:
+        raise HTTPException(status_code=422, detail="superseded_by_capture_id must reference one of this user's captures")
+
+
+def _touch_capture_revision(
+    capture: Capture,
+    *,
+    now: datetime,
+    reason: str,
+    actor: str,
+    source_message_ids: list[str] | None,
+) -> None:
+    capture.updated_at = now
+    capture.revision = (capture.revision or 1) + 1
+    capture.revision_reason = reason
+    capture.revision_actor = actor
+    capture.revision_source_ids_json = _source_ids_json(source_message_ids)
+
+
+def _touch_card_revision(
+    card: MemoryFactCard,
+    *,
+    now: datetime,
+    reason: str,
+    actor: str,
+    source_message_ids: list[str] | None,
+) -> None:
+    card.updated_at = now
+    card.revision = (card.revision or 1) + 1
+    card.revision_reason = reason
+    card.revision_actor = actor
+    card.revision_source_ids_json = _source_ids_json(source_message_ids)
+
+
+def _mark_derived_cards(
+    session: Session,
+    *,
+    capture: Capture,
+    status_value: str,
+    now: datetime,
+    reason: str,
+    actor: str,
+    source_message_ids: list[str] | None,
+    idempotency_key: str | None,
+) -> list[int]:
+    if not capture.id:
+        return []
+    cards = list(session.exec(select(MemoryFactCard).where(MemoryFactCard.source_capture_id == capture.id)).all())
+    changed_card_ids: list[int] = []
+    for card in cards:
+        if card.memory_status == status_value:
+            continue
+        before = revision_snapshot(card, CARD_REVISION_FIELDS)
+        card.memory_status = status_value
+        if status_value == "deleted":
+            card.deleted_at = card.deleted_at or now
+        elif status_value == ACTIVE_MEMORY_STATUS:
+            card.deleted_at = None
+        _touch_card_revision(card, now=now, reason=reason, actor=actor, source_message_ids=source_message_ids)
+        session.add(card)
+        _record_revision(
+            session,
+            target_type="memory_fact_card",
+            target_id=card.id,
+            user_id=capture.user_id,
+            action="derived_status",
+            before=before,
+            after=revision_snapshot(card, CARD_REVISION_FIELDS),
+            reason=reason,
+            actor=actor,
+            source_message_ids=source_message_ids,
+            idempotency_key=idempotency_key,
+        )
+        if card.id is not None:
+            changed_card_ids.append(card.id)
+    return changed_card_ids
+
+
+@app.patch("/v1/memories/{capture_id}")
+@app.patch("/v1/captures/{capture_id}")
+def patch_capture(
+    capture_id: int,
+    body: CapturePatchBody,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    """Correct, supersede, retract, or otherwise revise a memory capture."""
+    capture = _get_owned_capture(session, capture_id, user_id)
+    existing_revision = _existing_revision_for_key(
+        session,
+        target_type="capture",
+        target_id=capture_id,
+        user_id=user_id,
+        idempotency_key=body.idempotency_key,
+    )
+    if existing_revision:
+        return _capture_response(capture, action="update", revision_id=existing_revision.id, idempotent=True)
+
+    _check_expected_revision(capture, body.expected_revision)
+    reason = _require_reason(body.revision_reason)
+    actor = (body.revision_actor or user_id).strip() or user_id
+    incoming = body.model_dump(exclude_unset=True)
+    patch_values = {key: value for key, value in incoming.items() if key in CAPTURE_PATCH_FIELDS}
+    if not patch_values:
+        raise HTTPException(status_code=422, detail="At least one mutable memory field is required")
+
+    before = revision_snapshot(capture, CAPTURE_REVISION_FIELDS)
+    now = _utcnow()
+    content_changed = False
+
+    if "raw_content" in patch_values:
+        if patch_values["raw_content"] is None:
+            raise HTTPException(status_code=422, detail="raw_content cannot be null")
+        safe_content = redact_secrets(patch_values["raw_content"])
+        source_for_validation = patch_values.get("source") or capture.source
+        allowed, reject_reason = should_capture_memory(safe_content, source_for_validation)
+        if not allowed:
+            raise HTTPException(status_code=422, detail={"message": "Capture update rejected", "reason": reject_reason})
+        content_changed = safe_content != capture.raw_content
+        capture.raw_content = safe_content
+
+    if "source" in patch_values:
+        source_value = (patch_values["source"] or "").strip()
+        if not source_value:
+            raise HTTPException(status_code=422, detail="source cannot be blank")
+        capture.source = source_value
+
+    for field in (
+        "source_system",
+        "source_path",
+        "source_type",
+        "observed_at",
+        "imported_at",
+        "content_hash",
+        "import_batch_id",
+    ):
+        if field in patch_values:
+            setattr(capture, field, patch_values[field])
+
+    if "historical_until_verified" in patch_values:
+        if patch_values["historical_until_verified"] is None:
+            raise HTTPException(status_code=422, detail="historical_until_verified cannot be null")
+        capture.historical_until_verified = bool(patch_values["historical_until_verified"])
+
+    if "superseded_by_capture_id" in patch_values:
+        _validate_supersession_target(
+            session,
+            capture=capture,
+            superseded_by_capture_id=patch_values["superseded_by_capture_id"],
+            user_id=user_id,
+        )
+        capture.superseded_by_capture_id = patch_values["superseded_by_capture_id"]
+        if patch_values["superseded_by_capture_id"] and "memory_status" not in patch_values:
+            capture.memory_status = "superseded"
+
+    if "memory_status" in patch_values:
+        if patch_values["memory_status"] is None:
+            raise HTTPException(status_code=422, detail="memory_status cannot be null")
+        capture.memory_status = normalize_memory_status(patch_values["memory_status"])
+
+    if capture.memory_status == "deleted":
+        capture.deleted_at = capture.deleted_at or now
+    elif capture.memory_status == ACTIVE_MEMORY_STATUS:
+        capture.deleted_at = None
+
+    after_without_revision = revision_snapshot(capture, CAPTURE_REVISION_FIELDS)
+    if before == after_without_revision:
+        raise HTTPException(status_code=422, detail="Patch did not change the memory")
+
+    _touch_capture_revision(capture, now=now, reason=reason, actor=actor, source_message_ids=body.source_message_ids)
+    session.add(capture)
+
+    derived_card_status: str | None = None
+    if is_inactive_memory_status(capture.memory_status):
+        derived_card_status = capture.memory_status
+    elif content_changed:
+        derived_card_status = "stale"
+    changed_card_ids = []
+    if derived_card_status:
+        changed_card_ids = _mark_derived_cards(
+            session,
+            capture=capture,
+            status_value=derived_card_status,
+            now=now,
+            reason=reason,
+            actor=actor,
+            source_message_ids=body.source_message_ids,
+            idempotency_key=body.idempotency_key,
+        )
+
+    if content_changed and capture.memory_status == ACTIVE_MEMORY_STATUS and body.reindex:
+        upsert_capture_chunk(session, capture)
+
+    revision = _record_revision(
+        session,
+        target_type="capture",
+        target_id=capture_id,
+        user_id=user_id,
+        action="update",
+        before=before,
+        after=revision_snapshot(capture, CAPTURE_REVISION_FIELDS),
+        reason=reason,
+        actor=actor,
+        source_message_ids=body.source_message_ids,
+        idempotency_key=body.idempotency_key,
+    )
+    session.commit()
+    session.refresh(capture)
+    session.refresh(revision)
+    data = _capture_response(capture, action="update", revision_id=revision.id)
+    data["derived_card_status"] = derived_card_status
+    data["derived_card_ids"] = changed_card_ids
+    data["reindexed"] = bool(content_changed and capture.memory_status == ACTIVE_MEMORY_STATUS and body.reindex)
+    return data
+
+
+@app.delete("/v1/memories/{capture_id}")
+@app.delete("/v1/captures/{capture_id}")
+def delete_capture(
+    capture_id: int,
+    body: CaptureDeleteBody | None = Body(default=None),
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    """Soft-delete a memory capture by tombstoning it and its derived cards."""
+    body = body or CaptureDeleteBody()
+    capture = _get_owned_capture(session, capture_id, user_id)
+    existing_revision = _existing_revision_for_key(
+        session,
+        target_type="capture",
+        target_id=capture_id,
+        user_id=user_id,
+        idempotency_key=body.idempotency_key,
+    )
+    if existing_revision:
+        return _capture_response(capture, action="delete", revision_id=existing_revision.id, idempotent=True)
+
+    _check_expected_revision(capture, body.expected_revision)
+    reason = _require_reason(body.reason)
+    actor = (body.actor or user_id).strip() or user_id
+    if capture.memory_status == "deleted":
+        return _capture_response(capture, action="delete", revision_id=None, idempotent=True)
+
+    before = revision_snapshot(capture, CAPTURE_REVISION_FIELDS)
+    now = _utcnow()
+    capture.memory_status = "deleted"
+    capture.deleted_at = now
+    _touch_capture_revision(capture, now=now, reason=reason, actor=actor, source_message_ids=body.source_message_ids)
+    session.add(capture)
+    changed_card_ids = _mark_derived_cards(
+        session,
+        capture=capture,
+        status_value="deleted",
+        now=now,
+        reason=reason,
+        actor=actor,
+        source_message_ids=body.source_message_ids,
+        idempotency_key=body.idempotency_key,
+    )
+    revision = _record_revision(
+        session,
+        target_type="capture",
+        target_id=capture_id,
+        user_id=user_id,
+        action="delete",
+        before=before,
+        after=revision_snapshot(capture, CAPTURE_REVISION_FIELDS),
+        reason=reason,
+        actor=actor,
+        source_message_ids=body.source_message_ids,
+        idempotency_key=body.idempotency_key,
+    )
+    session.commit()
+    session.refresh(capture)
+    session.refresh(revision)
+    data = _capture_response(capture, action="delete", revision_id=revision.id)
+    data["derived_card_ids"] = changed_card_ids
+    return data
+
+
 @app.get("/v1/captures/{capture_id}/chunks")
 def get_capture_chunks(
     capture_id: int,
@@ -641,6 +1247,11 @@ def _format_result(
         "content_hash": capture.content_hash,
         "import_batch_id": capture.import_batch_id,
         "historical_until_verified": capture.historical_until_verified,
+        "memory_status": capture.memory_status,
+        "revision": capture.revision,
+        "updated_at": capture.updated_at,
+        "deleted_at": capture.deleted_at,
+        "superseded_by_capture_id": capture.superseded_by_capture_id,
         "match_type": match_type,
         "rank_reason": rank_reason,
         "score": score,
@@ -677,6 +1288,13 @@ def _format_card_result(
         "project_slug": card.project_slug,
         "historical_status": card.historical_status,
         "memory_visibility": card.memory_visibility or "historical_evidence",
+        "memory_status": capture.memory_status,
+        "revision": capture.revision,
+        "updated_at": capture.updated_at,
+        "deleted_at": capture.deleted_at,
+        "superseded_by_capture_id": capture.superseded_by_capture_id,
+        "card_memory_status": card.memory_status,
+        "card_revision": card.revision,
         "match_type": match_type,
         "rank_reason": rank_reason,
         "score": score,
@@ -688,7 +1306,9 @@ def _captures_for_cards(session: Session, cards: list[MemoryFactCard], user_id: 
     capture_ids = {card.source_capture_id for card in cards if card.source_capture_id}
     if not capture_ids:
         return {}
-    captures = session.exec(select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id)).all()
+    captures = session.exec(
+        select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id, _active_capture_condition())
+    ).all()
     return {capture.id: capture for capture in captures if capture.id is not None}
 
 
@@ -711,7 +1331,16 @@ def _excluded_memory_visibilities(include_operational: bool) -> set[str]:
     return set() if include_operational else OPERATIONAL_RECALL_VISIBILITIES
 
 
+def _active_capture_condition():
+    return or_(Capture.memory_status.is_(None), Capture.memory_status == ACTIVE_MEMORY_STATUS)
+
+
+def _active_card_condition():
+    return or_(MemoryFactCard.memory_status.is_(None), MemoryFactCard.memory_status == ACTIVE_MEMORY_STATUS)
+
+
 def _card_visibility_filter(stmt, include_operational: bool):
+    stmt = stmt.where(_active_card_condition())
     excluded = _excluded_memory_visibilities(include_operational)
     if not excluded:
         return stmt
@@ -727,10 +1356,14 @@ def _excluded_capture_ids_stmt(include_operational: bool):
     excluded = _excluded_memory_visibilities(include_operational)
     if not excluded:
         return None
-    return select(MemoryFactCard.source_capture_id).where(MemoryFactCard.memory_visibility.in_(excluded))
+    return select(MemoryFactCard.source_capture_id).where(
+        MemoryFactCard.memory_visibility.in_(excluded),
+        _active_card_condition(),
+    )
 
 
 def _capture_visibility_filter(stmt, include_operational: bool):
+    stmt = stmt.where(_active_capture_condition())
     excluded_capture_ids = _excluded_capture_ids_stmt(include_operational)
     if excluded_capture_ids is None:
         return stmt
@@ -738,6 +1371,8 @@ def _capture_visibility_filter(stmt, include_operational: bool):
 
 
 def _chunk_visibility_filter(stmt, include_operational: bool):
+    inactive_capture_ids = select(Capture.id).where(Capture.memory_status.in_(INACTIVE_MEMORY_STATUSES))
+    stmt = stmt.where(or_(Chunk.capture_id.is_(None), ~Chunk.capture_id.in_(inactive_capture_ids)))
     excluded_capture_ids = _excluded_capture_ids_stmt(include_operational)
     if excluded_capture_ids is None:
         return stmt
@@ -879,6 +1514,7 @@ def lexical_card_search(
         SELECT id
         FROM memoryfactcard
         WHERE 1=1
+          AND coalesce(memory_status, 'active') = 'active'
           {project_sql}
           {visibility_sql}
           AND (
@@ -910,7 +1546,7 @@ def lexical_card_search(
         card_ids = [card.id for card in session.exec(stmt.order_by(MemoryFactCard.observed_at.desc()).limit(candidate_limit)).all() if card.id]
     if not card_ids:
         return []
-    cards = session.exec(select(MemoryFactCard).where(MemoryFactCard.id.in_(card_ids))).all()
+    cards = session.exec(select(MemoryFactCard).where(MemoryFactCard.id.in_(card_ids), _active_card_condition())).all()
     cards_by_id = {card.id: card for card in cards}
     ordered_cards = [cards_by_id[card_id] for card_id in card_ids if card_id in cards_by_id]
     ordered_cards = _rerank_card_results(q, ordered_cards, limit)
@@ -1010,6 +1646,7 @@ def lexical_capture_search(
         SELECT c.id
         FROM capture c
         WHERE c.user_id = :user_id
+          AND coalesce(c.memory_status, 'active') = 'active'
           {project_sql}
           {visibility_sql}
           AND (
@@ -1040,7 +1677,9 @@ def lexical_capture_search(
 
     if not capture_ids:
         return []
-    captures = session.exec(select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id)).all()
+    captures = session.exec(
+        select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id, _active_capture_condition())
+    ).all()
     captures_by_id = {capture.id: capture for capture in captures}
     chunks_by_capture = _chunk_by_capture(session, set(capture_ids), user_id)
     return [
@@ -1072,7 +1711,9 @@ def semantic_chunk_search(
     capture_ids = {chunk.capture_id for chunk in chunks if chunk.capture_id}
     captures_by_id = {}
     if capture_ids:
-        captures = session.exec(select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id)).all()
+        captures = session.exec(
+            select(Capture).where(Capture.id.in_(capture_ids), Capture.user_id == user_id, _active_capture_condition())
+        ).all()
         captures_by_id = {capture.id: capture for capture in captures}
     results = []
     for idx, chunk in enumerate(chunks):
@@ -1106,6 +1747,28 @@ def merge_search_results(groups: list[list[dict]], limit: int) -> list[dict]:
             if len(merged) >= limit:
                 return merged
     return merged
+
+
+def is_historical_import_result(item: dict) -> bool:
+    source = str(item.get("source") or "").lower()
+    historical_status = str(item.get("historical_status") or "").lower()
+    return bool(
+        item.get("historical_until_verified")
+        or is_inactive_memory_status(item.get("memory_status"))
+        or source.startswith("historical-import")
+        or historical_status in {"historical", "legacy", "archived", "stale", "superseded"}
+    )
+
+
+def split_historical_import_results(results: list[dict]) -> tuple[list[dict], list[dict]]:
+    current: list[dict] = []
+    historical: list[dict] = []
+    for item in results:
+        if is_historical_import_result(item):
+            historical.append(item)
+        else:
+            current.append(item)
+    return current, historical
 
 
 def recent_capture_records(
@@ -1143,10 +1806,12 @@ def search_memory_records(
         return recent_capture_records(bounded_limit, project_slug, session, user_id, include_operational)
 
     exact = exact_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+    exact_current, exact_historical = split_historical_import_results(exact)
     card_exact = exact_card_alias_search(query, bounded_limit, project_slug, session, user_id, include_operational)
     card_lexical = lexical_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
     card_semantic = []
     lexical = lexical_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
+    lexical_current, lexical_historical = split_historical_import_results(lexical)
     semantic = []
     if include_semantic:
         try:
@@ -1157,8 +1822,14 @@ def search_memory_records(
             card_semantic = []
             semantic = []
     if is_identifier_query(query):
-        return merge_search_results([card_exact, exact, card_lexical, card_semantic, lexical, semantic], bounded_limit)
-    return merge_search_results([card_exact, card_lexical, card_semantic, exact, lexical, semantic], bounded_limit)
+        return merge_search_results(
+            [exact_current, card_exact, exact_historical, lexical_current, card_lexical, card_semantic, lexical_historical, semantic],
+            bounded_limit,
+        )
+    return merge_search_results(
+        [exact_current, card_exact, card_lexical, card_semantic, exact_historical, lexical_current, lexical_historical, semantic],
+        bounded_limit,
+    )
 
 
 @app.get("/v1/search")

@@ -16,12 +16,21 @@ def _api_headers() -> dict:
     return {"X-API-Key": MEMORY_API_KEY, "Content-Type": "application/json"}
 
 
+def _source_message_ids(value: Optional[str]) -> list[str] | None:
+    if not value:
+        return None
+    ids = [item.strip() for item in value.split(",") if item.strip()]
+    return ids or None
+
+
 mcp = FastMCP(
     name="Memory MCP",
     instructions=(
         "BYB Shared Memory service. Use byb_memory_search for canonical recall and "
-        "byb_memory_capture_verified for durable user memory. Do not claim a note was "
-        "saved unless the verified capture tool reports verified=true."
+        "byb_memory_capture_verified for durable user memory. Use byb_memory_patch_capture "
+        "or byb_memory_delete_capture to correct, supersede, retract, or tombstone stale "
+        "captures with a reason and source message IDs. Do not claim a note was saved "
+        "unless the verified capture tool reports verified=true."
     ),
 )
 
@@ -104,6 +113,78 @@ def byb_memory_get_capture(capture_id: int) -> str:
     )
     r.raise_for_status()
     return str(r.json())
+
+
+@mcp.tool
+def byb_memory_patch_capture(
+    capture_id: int,
+    reason: str,
+    raw_content: Optional[str] = None,
+    memory_status: Optional[str] = None,
+    superseded_by_capture_id: Optional[int] = None,
+    source_message_ids_csv: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    expected_revision: Optional[int] = None,
+) -> str:
+    """Correct or supersede a BYB Shared Memory capture with revision history."""
+    payload = {"revision_reason": reason}
+    if raw_content is not None:
+        payload["raw_content"] = raw_content
+    if memory_status is not None:
+        payload["memory_status"] = memory_status
+    if superseded_by_capture_id is not None:
+        payload["superseded_by_capture_id"] = superseded_by_capture_id
+    source_ids = _source_message_ids(source_message_ids_csv)
+    if source_ids:
+        payload["source_message_ids"] = source_ids
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    if expected_revision is not None:
+        payload["expected_revision"] = expected_revision
+    r = httpx.patch(
+        f"{MEMORY_API_URL}/v1/captures/{capture_id}",
+        json=payload,
+        headers=_api_headers(),
+        timeout=60.0,
+    )
+    r.raise_for_status()
+    out = r.json()
+    return (
+        f"Capture {capture_id} revised: status={out.get('memory_status')} "
+        f"revision={out.get('revision')} revision_id={out.get('revision_id')}"
+    )
+
+
+@mcp.tool
+def byb_memory_delete_capture(
+    capture_id: int,
+    reason: str,
+    source_message_ids_csv: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    expected_revision: Optional[int] = None,
+) -> str:
+    """Soft-delete a BYB Shared Memory capture with a tombstone reason."""
+    payload = {"reason": reason}
+    source_ids = _source_message_ids(source_message_ids_csv)
+    if source_ids:
+        payload["source_message_ids"] = source_ids
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    if expected_revision is not None:
+        payload["expected_revision"] = expected_revision
+    r = httpx.request(
+        "DELETE",
+        f"{MEMORY_API_URL}/v1/captures/{capture_id}",
+        json=payload,
+        headers=_api_headers(),
+        timeout=30.0,
+    )
+    r.raise_for_status()
+    out = r.json()
+    return (
+        f"Capture {capture_id} soft-deleted: status={out.get('memory_status')} "
+        f"revision={out.get('revision')} revision_id={out.get('revision_id')}"
+    )
 
 
 @mcp.tool

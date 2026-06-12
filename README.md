@@ -64,6 +64,31 @@ PYTHONPATH=. uvicorn services.memory_api.main:app --host 0.0.0.0 --port 8002
 sudo systemctl restart memory.backyardbrains.com
 ```
 
+## Memory Correction API
+
+Memory captures are revision-oriented. Agents should correct stale captures through the API instead of silently rewriting the retrieval record.
+
+- `PATCH /v1/captures/{capture_id}` or `PATCH /v1/memories/{capture_id}` revises a capture.
+- `DELETE /v1/captures/{capture_id}` or `DELETE /v1/memories/{capture_id}` soft-deletes a capture.
+- Valid `memory_status` values are `active`, `superseded`, `retracted`, `duplicate`, `stale`, and `deleted`.
+- Normal search returns only `active` captures and active fact cards.
+- Every update/delete requires a `revision_reason`; automated jobs should include `source_message_ids`, `idempotency_key`, and `expected_revision` when available.
+
+Example correction:
+
+```bash
+curl -X PATCH "$MEMORY_API_URL/v1/captures/123" \
+  -H "X-API-Key: $MEMORY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "raw_content": "Stan shipped the spike sorting work.",
+    "revision_reason": "Thread reply changed the capture from planned work to completed work.",
+    "source_message_ids": ["slack:C123:1780000000.000100"],
+    "idempotency_key": "hourly-thread-reconcile:C123:1780000000.000100:123",
+    "expected_revision": 1
+  }'
+```
+
 ### 4. Legacy Data Migration (One-Time Execution)
 
 If you are migrating from a legacy OpenClaw flat-file system, run this to port the old JSON-LD ontology into the Postgres brain.

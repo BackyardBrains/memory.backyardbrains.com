@@ -4,10 +4,37 @@ from pathlib import Path
 # Provide access to the rest of the application
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 from db.engine import engine
 from db.schema import Capture, Chunk
 from .embeddings import compute_embedding
+
+
+def upsert_capture_chunk(session: Session, capture: Capture) -> Chunk | None:
+    """Create or refresh the one semantic chunk for an active capture."""
+    if not capture.id or getattr(capture, "memory_status", "active") != "active":
+        return None
+
+    vector = compute_embedding(capture.raw_content)
+    chunks = list(session.exec(
+        select(Chunk).where(Chunk.capture_id == capture.id, Chunk.user_id == capture.user_id)
+    ).all())
+    if chunks:
+        chunk = chunks[0]
+        for existing_chunk in chunks:
+            existing_chunk.content = capture.raw_content
+            existing_chunk.embedding = vector
+            session.add(existing_chunk)
+    else:
+        chunk = Chunk(
+            content=capture.raw_content,
+            embedding=vector,
+            user_id=capture.user_id,
+            capture_id=capture.id,
+        )
+        session.add(chunk)
+    return chunk
+
 
 def process_capture(capture_id: int):
     """
@@ -20,14 +47,5 @@ def process_capture(capture_id: int):
         if not capture:
             return
 
-        # Simple approach: one chunk per capture
-        vector = compute_embedding(capture.raw_content)
-
-        chunk = Chunk(
-            content=capture.raw_content,
-            embedding=vector,
-            user_id=capture.user_id,
-            capture_id=capture.id
-        )
-        session.add(chunk)
+        upsert_capture_chunk(session, capture)
         session.commit()
