@@ -11,6 +11,7 @@ class ProjectCreate(BaseModel):
     title: str
     status: str = "Active"
     priority: str = "Normal"
+    lifecycle_state: str = "active"
 
 
 class ProjectOut(BaseModel):
@@ -19,6 +20,7 @@ class ProjectOut(BaseModel):
     title: str
     status: str
     priority: str
+    lifecycle_state: str = "active"
 
 
 class TaskCreate(BaseModel):
@@ -27,6 +29,14 @@ class TaskCreate(BaseModel):
     snooze_until: Optional[datetime] = None
     due_date: Optional[datetime] = None
     project_id: Optional[int] = None
+    attention_state: str = "active"
+    attention_reason: Optional[str] = None
+    blocker_type: Optional[str] = None
+    blocker_label: Optional[str] = None
+    blocker_task_id: Optional[int] = None
+    blocker_capture_id: Optional[int] = None
+    attention_updated_at: Optional[datetime] = None
+    attention_updated_by: Optional[str] = None
 
 
 class TaskOut(BaseModel):
@@ -36,10 +46,27 @@ class TaskOut(BaseModel):
     snooze_until: Optional[datetime] = None
     due_date: Optional[datetime] = None
     project_id: Optional[int] = None
+    attention_state: str = "active"
+    attention_reason: Optional[str] = None
+    blocker_type: Optional[str] = None
+    blocker_label: Optional[str] = None
+    blocker_task_id: Optional[int] = None
+    blocker_capture_id: Optional[int] = None
+    attention_updated_at: Optional[datetime] = None
+    attention_updated_by: Optional[str] = None
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(To Do|In Progress|Complete|Deferred)$")
+    status: Optional[str] = None
+    snooze_until: Optional[datetime] = None
+    attention_state: Optional[str] = Field(default=None, pattern="^(active|snoozed|deferred)$")
+    attention_reason: Optional[str] = None
+    blocker_type: Optional[str] = Field(default=None, pattern="^(person|date|dependency|evidence|external|decision)$")
+    blocker_label: Optional[str] = None
+    blocker_task_id: Optional[int] = None
+    blocker_capture_id: Optional[int] = None
+    attention_updated_at: Optional[datetime] = None
+    attention_updated_by: Optional[str] = None
 
 
 class PersonCreate(BaseModel):

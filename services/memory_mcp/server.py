@@ -192,10 +192,11 @@ def byb_memory_get_tasks(
     project_slug: Optional[str] = None,
     status: Optional[str] = None,
     include_complete: bool = True,
+    today_eligible: bool = False,
     limit: int = 50,
 ) -> str:
     """List canonical BYB Shared Memory tasks."""
-    params = {"include_complete": include_complete, "limit": limit}
+    params = {"include_complete": include_complete, "today_eligible": today_eligible, "limit": limit}
     if project_slug:
         params["project_slug"] = project_slug
     if status:
@@ -206,9 +207,14 @@ def byb_memory_get_tasks(
 
 
 @mcp.tool
-def byb_memory_get_projects() -> str:
-    """List canonical BYB Shared Memory projects."""
-    r = httpx.get(f"{MEMORY_API_URL}/v1/projects", headers=_api_headers(), timeout=30.0)
+def byb_memory_get_projects(state: str | None = None, include_closed: bool = False) -> str:
+    """List canonical BYB Shared Memory projects. Defaults to active/open projects."""
+    params = {}
+    if state:
+        params["state"] = state
+    if include_closed:
+        params["include_closed"] = "true"
+    r = httpx.get(f"{MEMORY_API_URL}/v1/projects", params=params, headers=_api_headers(), timeout=30.0)
     r.raise_for_status()
     return str(r.json())
 
@@ -239,16 +245,35 @@ def upsert_task(
     description: str,
     status: str = "To Do",
     project_id: Optional[int] = None,
+    snooze_until: Optional[str] = None,
+    attention_state: Optional[str] = None,
+    attention_reason: Optional[str] = None,
+    blocker_type: Optional[str] = None,
+    blocker_label: Optional[str] = None,
+    blocker_task_id: Optional[int] = None,
+    blocker_capture_id: Optional[int] = None,
 ) -> str:
     """Create or update a task. Use for structured work items.
     """
+    payload = {
+        "description": description,
+        "status": status,
+        "project_id": project_id,
+    }
+    for key, value in {
+        "snooze_until": snooze_until,
+        "attention_state": attention_state,
+        "attention_reason": attention_reason,
+        "blocker_type": blocker_type,
+        "blocker_label": blocker_label,
+        "blocker_task_id": blocker_task_id,
+        "blocker_capture_id": blocker_capture_id,
+    }.items():
+        if value is not None:
+            payload[key] = value
     r = httpx.post(
         f"{MEMORY_API_URL}/v1/tasks",
-        json={
-            "description": description,
-            "status": status,
-            "project_id": project_id,
-        },
+        json=payload,
         headers=_api_headers(),
         timeout=30.0,
     )
@@ -259,7 +284,7 @@ def upsert_task(
 
 @mcp.tool
 def set_task_status(task_id: int, status: str) -> str:
-    """Set a task's status. Allowed: To Do, In Progress, Complete, Deferred."""
+    """Set a task's lifecycle status. Prefer set_task_attention for snooze/defer."""
     r = httpx.patch(
         f"{MEMORY_API_URL}/v1/tasks/{task_id}",
         json={"status": status},
@@ -268,6 +293,43 @@ def set_task_status(task_id: int, status: str) -> str:
     )
     r.raise_for_status()
     return f"Task {task_id} status set to {status}"
+
+
+@mcp.tool
+def set_task_attention(
+    task_id: int,
+    attention_state: str,
+    attention_reason: Optional[str] = None,
+    snooze_until: Optional[str] = None,
+    blocker_type: Optional[str] = None,
+    blocker_label: Optional[str] = None,
+    blocker_task_id: Optional[int] = None,
+    blocker_capture_id: Optional[int] = None,
+) -> str:
+    """Set whether an open task can compete for today's attention."""
+    payload = {"attention_state": attention_state}
+    for key, value in {
+        "attention_reason": attention_reason,
+        "snooze_until": snooze_until,
+        "blocker_type": blocker_type,
+        "blocker_label": blocker_label,
+        "blocker_task_id": blocker_task_id,
+        "blocker_capture_id": blocker_capture_id,
+    }.items():
+        if value is not None:
+            payload[key] = value
+    r = httpx.patch(
+        f"{MEMORY_API_URL}/v1/tasks/{task_id}",
+        json=payload,
+        headers=_api_headers(),
+        timeout=30.0,
+    )
+    r.raise_for_status()
+    out = r.json()
+    return (
+        f"Task {task_id} attention set to {out.get('attention_state')} "
+        f"reason={out.get('attention_reason')}"
+    )
 
 
 @mcp.tool

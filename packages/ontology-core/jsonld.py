@@ -12,6 +12,7 @@ def project_to_jsonld(project: Any) -> dict:
         "title": project.title,
         "status": project.status,
         "priority": project.priority,
+        "lifecycleState": getattr(project, "lifecycle_state", "active") or "active",
     }
 
 
@@ -22,7 +23,21 @@ def task_to_jsonld(task: Any, project_slug: Optional[str] = None) -> dict:
         "@id": f"memory://task/{task.id}",
         "description": task.description,
         "status": task.status,
+        "attentionState": getattr(task, "attention_state", "active") or "active",
     }
+    for attr, jsonld_key in (
+        ("attention_reason", "attentionReason"),
+        ("blocker_type", "blockerType"),
+        ("blocker_label", "blockerLabel"),
+        ("blocker_task_id", "blockerTaskId"),
+        ("blocker_capture_id", "blockerCaptureId"),
+        ("attention_updated_by", "attentionUpdatedBy"),
+    ):
+        value = getattr(task, attr, None)
+        if value:
+            out[jsonld_key] = value
+    if getattr(task, "attention_updated_at", None):
+        out["attentionUpdatedAt"] = task.attention_updated_at.isoformat()
     if task.due_date:
         out["dueDate"] = task.due_date.isoformat()
     if task.snooze_until:

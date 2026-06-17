@@ -31,7 +31,8 @@ When searching, you can scope by:
 
 ### Boundaries
 
-- **Structured rules** (projects, tasks, events) live in relational tables. Create/update via `upsert_task`, `set_task_status`, etc.
+- **Structured rules** (projects, tasks, events) live in relational tables. Create/update via `upsert_task`, `set_task_status`, `set_task_attention`, etc.
+- Task lifecycle (`status`) is separate from Today eligibility (`attention_state`). Use `status` for existence/completion, and use `attention_state=active|snoozed|deferred` for whether an open task can compete for Greg's attention.
 - **Raw captures** are unparsed. Use `capture_note` for voice memos, quick thoughts, or scraps. The write pipeline will later extract chunks and embeddings.
 
 ## Resources
@@ -49,7 +50,8 @@ When searching, you can scope by:
 | `search_memory` | Semantic/lexical search; vague or exploratory queries |
 | `capture_note` | Add unstructured note to inbox |
 | `upsert_task` | Create task (optionally linked to project) |
-| `set_task_status` | Update task status (To Do, In Progress, Complete, Deferred) |
+| `set_task_status` | Update lifecycle status (for example To Do, In Progress, Complete, Dropped) |
+| `set_task_attention` | Set Today eligibility (`active`, `snoozed`, or `deferred`) |
 | `link_entities` | (Planned) Link entities via relations |
 
 ## Example Queries
@@ -58,3 +60,4 @@ When searching, you can scope by:
 - "Add a note: call Maribel about budget" → `capture_note(raw_content="call Maribel about budget", source="watson")`
 - "Create a task: Review NIMH proposal, due Friday" → `upsert_task(description="Review NIMH proposal", due_date=...)`
 - "Mark task 5 complete" → `set_task_status(task_id=5, status="Complete")`
+- "Wait for Maribel before task 394" → `set_task_attention(task_id=394, attention_state="deferred", blocker_type="person", blocker_label="Maribel content-lock signal")`

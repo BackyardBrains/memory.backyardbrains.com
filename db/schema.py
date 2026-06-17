@@ -23,6 +23,7 @@ class Project(SQLModel, table=True):
     title: str
     status: str = Field(default="Active")
     priority: str = Field(default="Normal")
+    lifecycle_state: str = Field(default="active", index=True)  # active, closed, archived
     category: Optional[str] = None  # e.g., "neuro", "plant", "invertebrate", "human"
     last_activity_at: Optional[datetime] = None  # Last meaningful change (Watson steward)
     waiting_on: Optional[str] = None  # e.g., "greg" or "external:Moritz"
@@ -39,6 +40,14 @@ class Task(SQLModel, table=True):
     due_date: Optional[datetime] = None
     draft_text: Optional[str] = Field(default=None, sa_column=Column(Text))  # Prepared email/reply body (Watson)
     state: Optional[str] = None  # Cortex triage state: "ready", "decision", "deep", "plain" (tolerant)
+    attention_state: str = Field(default="active", sa_column=Column(Text, nullable=False, server_default="active"))
+    attention_reason: Optional[str] = Field(default=None, sa_column=Column(Text))
+    blocker_type: Optional[str] = Field(default=None, sa_column=Column(Text))
+    blocker_label: Optional[str] = Field(default=None, sa_column=Column(Text))
+    blocker_task_id: Optional[int] = Field(default=None, foreign_key="task.id")
+    blocker_capture_id: Optional[int] = Field(default=None, foreign_key="capture.id")
+    attention_updated_at: Optional[datetime] = None
+    attention_updated_by: Optional[str] = None
 
     project_id: Optional[int] = Field(default=None, foreign_key="project.id")
     project: Optional[Project] = Relationship(back_populates="tasks")

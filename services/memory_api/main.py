@@ -5,12 +5,12 @@ import os
 import re
 import subprocess
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
 
@@ -23,6 +23,54 @@ from packages.memory_retrieval.embeddings import compute_embedding
 
 from services.memory_mcp.server import mcp
 mcp_app = mcp.http_app(path="/")
+
+PROJECT_LIFECYCLE_STATES = {"active", "closed", "archived"}
+PROJECT_LIST_STATES = PROJECT_LIFECYCLE_STATES | {"open", "all", "any"}
+PROJECT_CLOSED_STATUS_MARKERS = (
+    "closed",
+    "duplicate",
+    "retired",
+    "merged",
+    "archived",
+    "superseded",
+    "obsolete",
+    "cancelled",
+    "canceled",
+)
+
+
+def _normalize_project_lifecycle_state(value: str | None) -> str:
+    raw = (value or "active").strip().lower().replace("-", "_")
+    if raw == "open":
+        raw = "active"
+    if raw not in PROJECT_LIFECYCLE_STATES:
+        raise ValueError(f"lifecycle_state must be one of {sorted(PROJECT_LIFECYCLE_STATES)}")
+    return raw
+
+
+def _normalize_project_list_state(value: str | None, include_closed: bool) -> str:
+    raw = (value or "").strip().lower().replace("-", "_")
+    if not raw:
+        return "all" if include_closed else "active"
+    if raw == "open":
+        raw = "active"
+    if raw not in PROJECT_LIST_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {sorted(PROJECT_LIST_STATES)}")
+    return raw
+
+
+def _project_lifecycle_from_fields(
+    *,
+    status_value: str | None,
+    priority_value: str | None,
+    fallback: str = "active",
+) -> str:
+    priority_text = (priority_value or "").strip().lower()
+    status_text = (status_value or "").strip().lower()
+    if priority_text == "closed" or any(marker in status_text for marker in PROJECT_CLOSED_STATUS_MARKERS):
+        return "closed"
+    return _normalize_project_lifecycle_state(fallback)
+
 
 class CaptureBody(BaseModel):
     raw_content: str
@@ -67,6 +115,20 @@ class CaptureDeleteBody(BaseModel):
 # Known Cortex task states; tolerant — any short string is accepted (no hard enum).
 KNOWN_TASK_STATES = {"ready", "decision", "deep", "plain"}
 MAX_TASK_STATE_LENGTH = 64
+TASK_ATTENTION_STATES = {"active", "snoozed", "deferred"}
+TASK_BLOCKER_TYPES = {"person", "date", "dependency", "evidence", "external", "decision"}
+TASK_TERMINAL_STATUS_MARKERS = ("complete", "done", "dropped", "canceled", "cancelled", "closed")
+TASK_ATTENTION_FIELDS = {
+    "snooze_until",
+    "attention_state",
+    "attention_reason",
+    "blocker_type",
+    "blocker_label",
+    "blocker_task_id",
+    "blocker_capture_id",
+    "attention_updated_at",
+    "attention_updated_by",
+}
 
 
 def _validate_task_state(value: str | None) -> str | None:
@@ -82,16 +144,86 @@ def _validate_task_state(value: str | None) -> str | None:
     return state
 
 
+def _parse_optional_datetime(value) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        clean = value.strip()
+        if not clean:
+            return None
+        try:
+            parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("must be an ISO date or datetime") from exc
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    raise ValueError("must be an ISO date or datetime")
+
+
+def _normalize_task_attention_state(value: str | None, *, has_snooze: bool = False) -> str | None:
+    if value is None:
+        return None
+    state_value = value.strip().lower()
+    if not state_value:
+        return None
+    if state_value == "delayed":
+        return "snoozed" if has_snooze else "deferred"
+    if state_value not in TASK_ATTENTION_STATES:
+        raise ValueError(f"attention_state must be one of {sorted(TASK_ATTENTION_STATES)}")
+    return state_value
+
+
+def _normalize_blocker_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    blocker_type = value.strip().lower()
+    if not blocker_type:
+        return None
+    if blocker_type not in TASK_BLOCKER_TYPES:
+        raise ValueError(f"blocker_type must be one of {sorted(TASK_BLOCKER_TYPES)}")
+    return blocker_type
+
+
 class TaskBody(BaseModel):
     description: str
     status: str = "To Do"
     project_id: int | None = None
-    due_date: str | None = None
-    snooze_until: str | None = None
+    due_date: datetime | None = None
+    snooze_until: datetime | None = None
     draft_text: str | None = None
     state: str | None = None
+    attention_state: str = "active"
+    attention_reason: str | None = None
+    blocker_type: str | None = None
+    blocker_label: str | None = None
+    blocker_task_id: int | None = None
+    blocker_capture_id: int | None = None
+    attention_updated_at: datetime | None = None
+    attention_updated_by: str | None = None
 
     _validate_state = field_validator("state")(_validate_task_state)
+    _parse_due_date = field_validator("due_date", mode="before")(_parse_optional_datetime)
+    _parse_snooze_until = field_validator("snooze_until", mode="before")(_parse_optional_datetime)
+    _parse_attention_updated_at = field_validator("attention_updated_at", mode="before")(_parse_optional_datetime)
+
+    @model_validator(mode="after")
+    def normalize_attention_fields(self):
+        explicit_attention = "attention_state" in self.model_fields_set
+        has_snooze = self.snooze_until is not None
+        has_blocker = any(
+            value not in (None, "")
+            for value in (self.blocker_type, self.blocker_label, self.blocker_task_id, self.blocker_capture_id)
+        )
+        normalized = _normalize_task_attention_state(self.attention_state, has_snooze=has_snooze) or "active"
+        if not explicit_attention and has_snooze:
+            normalized = "snoozed"
+        elif not explicit_attention and has_blocker:
+            normalized = "deferred"
+        self.attention_state = normalized
+        if "blocker_type" in self.model_fields_set:
+            self.blocker_type = _normalize_blocker_type(self.blocker_type)
+        return self
 
 
 class TaskStatusBody(BaseModel):
@@ -99,8 +231,37 @@ class TaskStatusBody(BaseModel):
     status: str | None = None
     draft_text: str | None = None
     state: str | None = None
+    snooze_until: datetime | None = None
+    attention_state: str | None = None
+    attention_reason: str | None = None
+    blocker_type: str | None = None
+    blocker_label: str | None = None
+    blocker_task_id: int | None = None
+    blocker_capture_id: int | None = None
+    attention_updated_at: datetime | None = None
+    attention_updated_by: str | None = None
 
     _validate_state = field_validator("state")(_validate_task_state)
+    _parse_snooze_until = field_validator("snooze_until", mode="before")(_parse_optional_datetime)
+    _parse_attention_updated_at = field_validator("attention_updated_at", mode="before")(_parse_optional_datetime)
+
+    @model_validator(mode="after")
+    def normalize_attention_fields(self):
+        explicit_attention = "attention_state" in self.model_fields_set
+        has_snooze_patch = "snooze_until" in self.model_fields_set and self.snooze_until is not None
+        has_blocker_patch = any(
+            field in self.model_fields_set and getattr(self, field) not in (None, "")
+            for field in ("blocker_type", "blocker_label", "blocker_task_id", "blocker_capture_id")
+        )
+        if self.attention_state is not None:
+            self.attention_state = _normalize_task_attention_state(self.attention_state, has_snooze=has_snooze_patch)
+        elif not explicit_attention and has_snooze_patch:
+            self.attention_state = "snoozed"
+        elif not explicit_attention and has_blocker_patch:
+            self.attention_state = "deferred"
+        if "blocker_type" in self.model_fields_set:
+            self.blocker_type = _normalize_blocker_type(self.blocker_type)
+        return self
 
 
 class ProjectBody(BaseModel):
@@ -108,21 +269,28 @@ class ProjectBody(BaseModel):
     title: str
     status: str = "Active"
     priority: str = "Normal"
+    lifecycle_state: str = "active"
     category: str | None = None
     last_activity_at: datetime | None = None
     waiting_on: str | None = None
+
+    @field_validator("lifecycle_state")
+    @classmethod
+    def validate_lifecycle_state(cls, value: str | None) -> str:
+        return _normalize_project_lifecycle_state(value)
 
 
 class ProjectPatchBody(BaseModel):
     """PATCH body for projects. All fields optional; only provided fields are updated.
 
-    title/status/priority are audited core fields and require revision_reason.
+    title/status/priority/lifecycle_state are audited core fields and require revision_reason.
     category/last_activity_at/waiting_on are Cortex board metadata and may be
     patched without an explicit reason.
     """
     title: str | None = None
     status: str | None = None
     priority: str | None = None
+    lifecycle_state: str | None = None
     category: str | None = None
     last_activity_at: datetime | None = None
     waiting_on: str | None = None
@@ -130,6 +298,11 @@ class ProjectPatchBody(BaseModel):
     revision_actor: str | None = None
     source_message_ids: list[str] | None = None
     idempotency_key: str | None = None
+
+    @field_validator("lifecycle_state")
+    @classmethod
+    def validate_lifecycle_state(cls, value: str | None) -> str | None:
+        return _normalize_project_lifecycle_state(value) if value is not None else None
 
 
 class EventBody(BaseModel):
@@ -152,6 +325,69 @@ class LinkBody(BaseModel):
     note: str | None = None
     policy: str | None = None
     project_slug: str | None = None
+
+
+AGENT_COLORS = {"orange", "purple", "green", "blue", "yellow", "dark"}
+AGENT_LIFECYCLES = {"active", "pausing", "retiring", "retired"}
+AGENT_DASHBOARD_STATUSES = {"healthy", "needs_you", "error"}
+AGENT_PROFILE_SOURCE_TYPE = "agent-profile"
+AGENT_DASHBOARD_SNAPSHOT_SOURCE_TYPE = "agent-dashboard-snapshot"
+AGENT_DASHBOARD_EVENT_SOURCE_TYPE = "agent-dashboard-lifecycle-event"
+
+
+def _normalize_agent_choice(value: str, allowed: set[str], fallback: str) -> str:
+    clean = (value or fallback).strip().lower()
+    if clean not in allowed:
+        raise ValueError(f"must be one of {sorted(allowed)}")
+    return clean
+
+
+class AgentProfileBody(BaseModel):
+    agent_id: str
+    display_name: str
+    role: str
+    color: str = "blue"
+    lifecycle: str = "active"
+    updated_at: datetime | None = None
+    retired_at: datetime | None = None
+    retired_reason: str | None = None
+    successor_agent_id: str | None = None
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value: str) -> str:
+        return _normalize_agent_choice(value, AGENT_COLORS, "blue")
+
+    @field_validator("lifecycle")
+    @classmethod
+    def validate_lifecycle(cls, value: str) -> str:
+        return _normalize_agent_choice(value, AGENT_LIFECYCLES, "active")
+
+
+class AgentDashboardSnapshotBody(BaseModel):
+    agent_id: str
+    dashboard_version: str | None = None
+    generated_at: datetime | None = None
+    next_expected_at: datetime | None = None
+    expires_at: datetime | None = None
+    status: str = "healthy"
+    needs_you_count: int = 0
+    blocks: list[dict] = []
+    change_note: str | None = None
+    source_run_id: str | None = None
+    source_ref: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        return _normalize_agent_choice(value, AGENT_DASHBOARD_STATUSES, "healthy")
+
+    @field_validator("needs_you_count")
+    @classmethod
+    def validate_needs_you_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("needs_you_count must be non-negative")
+        return value
 
 
 # API Key: sk_byb_{user_id} e.g. sk_byb_greg_xxxx
@@ -305,6 +541,57 @@ def _utcnow() -> datetime:
     return datetime.utcnow()
 
 
+def _normalize_compare_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _is_terminal_task_status(value: str | None) -> bool:
+    status_value = (value or "").strip().lower()
+    return any(marker in status_value for marker in TASK_TERMINAL_STATUS_MARKERS) or "✅" in (value or "")
+
+
+def _task_open_lifecycle_conditions():
+    return (
+        ~Task.status.ilike("%complete%"),
+        ~Task.status.ilike("%done%"),
+        ~Task.status.ilike("%dropped%"),
+        ~Task.status.ilike("%canceled%"),
+        ~Task.status.ilike("%cancelled%"),
+        ~Task.status.ilike("%closed%"),
+        ~Task.status.ilike("%✅%"),
+    )
+
+
+def _is_today_eligible_task(task: Task, *, now: datetime | None = None) -> bool:
+    if _is_terminal_task_status(task.status):
+        return False
+    attention_state = (task.attention_state or "active").strip().lower()
+    if attention_state == "deferred":
+        return False
+    if attention_state != "snoozed":
+        return True
+    snooze_until = _normalize_compare_datetime(task.snooze_until)
+    if snooze_until is None:
+        return True
+    today = (_normalize_compare_datetime(now) or _utcnow()).date()
+    return snooze_until.date() <= today
+
+
+def _validate_task_attention(task: Task) -> None:
+    attention_state = (task.attention_state or "active").strip().lower()
+    if attention_state not in TASK_ATTENTION_STATES:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Invalid attention_state", "allowed": sorted(TASK_ATTENTION_STATES)},
+        )
+    if attention_state == "snoozed" and task.snooze_until is None:
+        raise HTTPException(status_code=422, detail="snoozed tasks require snooze_until")
+
+
 def _require_reason(reason: str | None) -> str:
     clean_reason = (reason or "").strip()
     if not clean_reason:
@@ -320,6 +607,94 @@ def _json_default(value):
 
 def _json_dumps(value) -> str:
     return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+def _parse_agent_payload(capture: Capture) -> dict | None:
+    try:
+        payload = json.loads(capture.raw_content or "{}")
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_agent_time(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _agent_record_time(payload: dict, capture: Capture, keys: tuple[str, ...]) -> datetime:
+    for key in keys:
+        parsed = _parse_agent_time(payload.get(key))
+        if parsed:
+            return parsed
+    return capture.observed_at or capture.updated_at or capture.created_at
+
+
+def _agent_time_key(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _latest_agent_payloads(captures: list[Capture], keys: tuple[str, ...]) -> list[dict]:
+    latest: dict[str, tuple[tuple[datetime, datetime, int], dict]] = {}
+    for capture in captures:
+        payload = _parse_agent_payload(capture)
+        if not payload:
+            continue
+        agent_id = str(payload.get("agent_id") or payload.get("agentId") or payload.get("id") or "").strip()
+        if not agent_id:
+            continue
+        recorded_at = _agent_time_key(_agent_record_time(payload, capture, keys))
+        capture_time = _agent_time_key(capture.created_at or capture.updated_at or capture.observed_at)
+        sort_key = (recorded_at, capture_time, int(capture.id or 0))
+        current = latest.get(agent_id)
+        if current is None or sort_key > current[0]:
+            latest[agent_id] = (sort_key, payload)
+    return [item[1] for item in sorted(latest.values(), key=lambda item: str(item[1].get("agent_id") or item[1].get("agentId") or item[1].get("id")))]
+
+
+def _agent_capture(
+    body: BaseModel,
+    *,
+    source_type: str,
+    observed_at: datetime | None,
+    user_id: str,
+) -> Capture:
+    payload = body.model_dump(mode="json", exclude_none=True)
+    agent_id = str(payload["agent_id"]).strip()
+    payload["kind"] = source_type
+    return Capture(
+        raw_content=_json_dumps(payload),
+        source=f"agent:{agent_id}",
+        user_id=user_id,
+        source_system="agent-dashboard",
+        source_path=f"agents/{agent_id}/{source_type}",
+        source_type=source_type,
+        observed_at=observed_at,
+    )
+
+
+def _agent_captures(session: Session, *, user_id: str, source_type: str, limit: int = 500) -> list[Capture]:
+    stmt = (
+        select(Capture)
+        .where(
+            Capture.user_id == user_id,
+            Capture.source_type == source_type,
+            _active_capture_condition(),
+        )
+        .order_by(Capture.created_at.desc())
+        .limit(limit)
+    )
+    return list(session.exec(stmt).all())
 
 
 CAPTURE_REVISION_FIELDS = (
@@ -368,7 +743,16 @@ CARD_REVISION_FIELDS = (
     "provenance_json",
     "created_at",
 )
-PROJECT_REVISION_FIELDS = ("slug", "title", "status", "priority", "category", "last_activity_at", "waiting_on")
+PROJECT_REVISION_FIELDS = (
+    "slug",
+    "title",
+    "status",
+    "priority",
+    "lifecycle_state",
+    "category",
+    "last_activity_at",
+    "waiting_on",
+)
 
 
 def revision_snapshot(record, fields: tuple[str, ...]) -> dict:
@@ -508,13 +892,88 @@ def health():
     return service_metadata()
 
 
-@app.get("/v1/projects", response_model=list)
-def list_projects(
+@app.get("/v1/agents")
+def list_agents(
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
 ):
-    """List projects (no user filter on projects for now; scope later)."""
+    captures = _agent_captures(session, user_id=user_id, source_type=AGENT_PROFILE_SOURCE_TYPE)
+    return {"agents": _latest_agent_payloads(captures, ("updated_at", "retired_at"))}
+
+
+@app.post("/v1/agents")
+def publish_agent_profile(
+    body: AgentProfileBody,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    capture = _agent_capture(
+        body,
+        source_type=AGENT_PROFILE_SOURCE_TYPE,
+        observed_at=body.updated_at or body.retired_at,
+        user_id=user_id,
+    )
+    session.add(capture)
+    session.commit()
+    session.refresh(capture)
+    background_tasks.add_task(process_capture, capture.id)
+    return {
+        "ok": True,
+        "agent_id": body.agent_id,
+        "capture_id": capture.id,
+        "source_type": AGENT_PROFILE_SOURCE_TYPE,
+        "memory_system": MEMORY_SYSTEM,
+    }
+
+
+@app.get("/v1/agents/status/latest")
+def list_latest_agent_dashboard_statuses(
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    captures = _agent_captures(session, user_id=user_id, source_type=AGENT_DASHBOARD_SNAPSHOT_SOURCE_TYPE)
+    return {"statuses": _latest_agent_payloads(captures, ("generated_at", "expires_at"))}
+
+
+@app.post("/v1/agents/status")
+def publish_agent_dashboard_status(
+    body: AgentDashboardSnapshotBody,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    capture = _agent_capture(
+        body,
+        source_type=AGENT_DASHBOARD_SNAPSHOT_SOURCE_TYPE,
+        observed_at=body.generated_at,
+        user_id=user_id,
+    )
+    session.add(capture)
+    session.commit()
+    session.refresh(capture)
+    background_tasks.add_task(process_capture, capture.id)
+    return {
+        "ok": True,
+        "agent_id": body.agent_id,
+        "capture_id": capture.id,
+        "source_type": AGENT_DASHBOARD_SNAPSHOT_SOURCE_TYPE,
+        "memory_system": MEMORY_SYSTEM,
+    }
+
+
+@app.get("/v1/projects", response_model=list)
+def list_projects(
+    state: str | None = None,
+    include_closed: bool = False,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    """List active projects by default; closed/archived rows require an explicit query."""
     stmt = select(Project)
+    normalized_state = _normalize_project_list_state(state, include_closed)
+    if normalized_state not in {"all", "any"}:
+        stmt = stmt.where(Project.lifecycle_state == normalized_state)
     return list(session.exec(stmt).all())
 
 
@@ -540,6 +999,11 @@ def create_project(
         title=body.title,
         status=body.status,
         priority=body.priority,
+        lifecycle_state=_project_lifecycle_from_fields(
+            status_value=body.status,
+            priority_value=body.priority,
+            fallback=body.lifecycle_state,
+        ),
         category=body.category,
         last_activity_at=body.last_activity_at,
         waiting_on=body.waiting_on,
@@ -575,7 +1039,15 @@ def patch_project(
         return _project_response(project, action="update", revision_id=existing_revision.id, idempotent=True)
 
     incoming = body.model_dump(exclude_unset=True)
-    patch_values = {key: value for key, value in incoming.items() if key in {"title", "status", "priority"}}
+    if "lifecycle_state" not in incoming:
+        inferred_lifecycle = _project_lifecycle_from_fields(
+            status_value=incoming.get("status"),
+            priority_value=incoming.get("priority"),
+            fallback=project.lifecycle_state,
+        )
+        if inferred_lifecycle != project.lifecycle_state:
+            incoming["lifecycle_state"] = inferred_lifecycle
+    patch_values = {key: value for key, value in incoming.items() if key in {"title", "status", "priority", "lifecycle_state"}}
     board_values = {key: value for key, value in incoming.items() if key in {"category", "last_activity_at", "waiting_on"}}
     if not patch_values and not board_values:
         raise HTTPException(status_code=422, detail="At least one mutable project field is required")
@@ -626,6 +1098,7 @@ def list_tasks(
     project_slug: str | None = None,
     status: str | None = None,
     include_complete: bool = True,
+    today_eligible: bool = False,
     limit: int = 50,
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
@@ -638,13 +1111,25 @@ def list_tasks(
     if status:
         stmt = stmt.where(Task.status.ilike(f"%{status}%"))
     if not include_complete:
+        stmt = stmt.where(*_task_open_lifecycle_conditions())
+    if today_eligible:
+        tomorrow = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         stmt = stmt.where(
-            ~Task.status.ilike("%complete%"),
-            ~Task.status.ilike("%deferred%"),
-            ~Task.status.ilike("%✅%"),
+            *_task_open_lifecycle_conditions(),
+            Task.attention_state != "deferred",
+            or_(
+                Task.attention_state != "snoozed",
+                Task.snooze_until == None,  # noqa: E711
+                Task.snooze_until < tomorrow,
+            ),
         )
     stmt = stmt.limit(min(limit, 200))
     tasks = list(session.exec(stmt).all())
+    if not include_complete:
+        tasks = [t for t in tasks if not _is_terminal_task_status(t.status)]
+    if today_eligible:
+        now = _utcnow()
+        tasks = [t for t in tasks if _is_today_eligible_task(t, now=now)]
     # Enrich with project slug for Watson
     result = []
     for t in tasks:
@@ -1231,19 +1716,24 @@ def create_task(
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
 ):
-    from datetime import datetime
-
-    due_dt = datetime.fromisoformat(body.due_date.replace("Z", "+00:00")) if body.due_date else None
-    snooze_dt = datetime.fromisoformat(body.snooze_until.replace("Z", "+00:00")) if body.snooze_until else None
     task = Task(
         description=body.description,
         status=body.status,
         project_id=body.project_id,
-        due_date=due_dt,
-        snooze_until=snooze_dt,
+        due_date=body.due_date,
+        snooze_until=body.snooze_until,
         draft_text=body.draft_text,
         state=body.state,
+        attention_state=body.attention_state,
+        attention_reason=body.attention_reason,
+        blocker_type=body.blocker_type,
+        blocker_label=body.blocker_label,
+        blocker_task_id=body.blocker_task_id,
+        blocker_capture_id=body.blocker_capture_id,
+        attention_updated_at=body.attention_updated_at,
+        attention_updated_by=body.attention_updated_by,
     )
+    _validate_task_attention(task)
     session.add(task)
     session.commit()
     session.refresh(task)
@@ -1260,8 +1750,21 @@ def set_task_status(
     task = session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    for field, value in body.model_dump(exclude_unset=True).items():
+    patch_values = body.model_dump(exclude_unset=True)
+    if patch_values.get("snooze_until") is not None and "attention_state" not in patch_values:
+        patch_values["attention_state"] = "snoozed"
+    if "attention_state" not in patch_values and any(
+        patch_values.get(field) not in (None, "")
+        for field in ("blocker_type", "blocker_label", "blocker_task_id", "blocker_capture_id")
+    ):
+        patch_values["attention_state"] = "deferred"
+    for field, value in patch_values.items():
         setattr(task, field, value)
+    if TASK_ATTENTION_FIELDS.intersection(patch_values) and "attention_updated_at" not in patch_values:
+        task.attention_updated_at = _utcnow()
+    if TASK_ATTENTION_FIELDS.intersection(patch_values) and "attention_updated_by" not in patch_values:
+        task.attention_updated_by = user_id
+    _validate_task_attention(task)
     session.add(task)
     session.commit()
     session.refresh(task)
