@@ -69,62 +69,35 @@ def test_split_historical_import_results_keeps_current_first():
             {"capture_id": 2, "source": "historical-import:markdown"},
             {"capture_id": 3, "historical_until_verified": True},
             {"capture_id": 4, "historical_status": "stale"},
+            {"capture_id": 5, "historical_status": "historical_verified"},
+            {"capture_id": 6, "memory_visibility": "historical_evidence"},
         ]
     )
 
     assert [item["capture_id"] for item in current] == [1]
-    assert [item["capture_id"] for item in historical] == [2, 3, 4]
+    assert [item["capture_id"] for item in historical] == [2, 3, 4, 5, 6]
 
 
-def test_identifier_search_prefers_fresh_exact_capture_over_card(monkeypatch):
-    monkeypatch.setattr(
-        memory_main,
-        "exact_capture_search",
-        lambda *args, **kwargs: [{"capture_id": 11533, "chunk_id": None, "match_type": "exact", "source": "addy"}],
-    )
-    monkeypatch.setattr(
-        memory_main,
-        "exact_card_alias_search",
-        lambda *args, **kwargs: [{"capture_id": 900, "chunk_id": None, "match_type": "card_exact", "source": "historical-import:markdown"}],
-    )
-    monkeypatch.setattr(memory_main, "lexical_card_search", lambda *args, **kwargs: [])
-    monkeypatch.setattr(memory_main, "lexical_capture_search", lambda *args, **kwargs: [])
 
-    results = memory_main.search_memory_records(
-        q="6984856859858",
-        limit=10,
-        project_slug=None,
-        session=None,
-        user_id="greg",
-        include_semantic=False,
-    )
-
-    assert [item["capture_id"] for item in results[:2]] == [11533, 900]
+def test_current_semantic_search_result_beats_historical_cards():
+    from packages.memory_retrieval.ranking import fuse
+    old = dict(capture_id=900,raw_content="SpikerBot robot connection layer",source="historical-import:markdown")
+    new = dict(capture_id=104266,raw_content="SpikerBot robot connection layer",source="watson")
+    result=fuse([('card_lexical',1,[old]),('semantic',1,[old,new])],2,'SpikerBot robot connection layer')
+    assert [r['capture_id'] for r in result] == [104266,900]
 
 
-def test_identifier_search_keeps_historical_exact_behind_card_alias(monkeypatch):
-    monkeypatch.setattr(
-        memory_main,
-        "exact_capture_search",
-        lambda *args, **kwargs: [
-            {"capture_id": 901, "chunk_id": None, "match_type": "exact", "source": "historical-import:markdown"}
-        ],
-    )
-    monkeypatch.setattr(
-        memory_main,
-        "exact_card_alias_search",
-        lambda *args, **kwargs: [{"capture_id": 902, "chunk_id": None, "match_type": "card_exact", "source": "watson"}],
-    )
-    monkeypatch.setattr(memory_main, "lexical_card_search", lambda *args, **kwargs: [])
-    monkeypatch.setattr(memory_main, "lexical_capture_search", lambda *args, **kwargs: [])
+def test_identifier_search_prefers_fresh_exact_capture_over_card():
+    from packages.memory_retrieval.ranking import fuse
+    new=dict(capture_id=11533,raw_content="6984856859858",source="addy")
+    old=dict(capture_id=900,raw_content="6984856859858",source="historical-import:markdown")
+    result=fuse([('exact',3,[new]),('alias',3,[old])],10,'6984856859858')
+    assert [r['capture_id'] for r in result] == [11533,900]
 
-    results = memory_main.search_memory_records(
-        q="6986130790658",
-        limit=10,
-        project_slug=None,
-        session=None,
-        user_id="greg",
-        include_semantic=False,
-    )
 
-    assert [item["capture_id"] for item in results[:2]] == [902, 901]
+def test_identifier_search_keeps_historical_exact_behind_card_alias():
+    from packages.memory_retrieval.ranking import fuse
+    old=dict(capture_id=901,raw_content="6986130790658",source="historical-import:markdown")
+    new=dict(capture_id=902,raw_content="Current product alias",source="watson")
+    result=fuse([('exact',3,[old]),('alias',3,[new])],10,'6986130790658')
+    assert [r['capture_id'] for r in result] == [902,901]

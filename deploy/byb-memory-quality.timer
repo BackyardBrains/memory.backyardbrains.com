@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Watson retrieval and indexing each morning without creating canary notes
+
+[Timer]
+OnCalendar=*-*-* 08:15:00 UTC
+Persistent=true
+Unit=byb-memory-quality.service
+
+[Install]
+WantedBy=timers.target

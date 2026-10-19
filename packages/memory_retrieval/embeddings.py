@@ -4,6 +4,7 @@ Using BAAI/bge-small-en-v1.5 which is very fast and produces 384-dimensional vec
 """
 import os
 import threading
+from functools import lru_cache
 from typing import List
 
 from sentence_transformers import SentenceTransformer
@@ -27,6 +28,7 @@ def get_model() -> SentenceTransformer:
     return _model
 
 
+@lru_cache(maxsize=256)
 def compute_embedding(text: str) -> List[float]:
     """
     Compute exactly one 384-dimensional dense vector for a single text string.

@@ -119,6 +119,15 @@ class Capture(SQLModel, table=True):
     content_hash: Optional[str] = Field(default=None, index=True)
     import_batch_id: Optional[str] = Field(default=None, index=True)
     historical_until_verified: bool = Field(default=False, index=True)
+    ingestion_key: Optional[str] = Field(default=None, index=True)
+    source_event_id: Optional[str] = None
+    event_type: Optional[str] = None
+    memory_visibility: str = Field(default="knowledge", index=True)
+    project_slug: Optional[str] = Field(default=None, index=True)
+    policy_scope: Optional[str] = None
+    index_state: str = Field(default="queued", index=True)
+    index_error: Optional[str] = None
+    index_updated_at: Optional[datetime] = None
 
     chunks: List["Chunk"] = Relationship(back_populates="capture")
 
@@ -193,4 +202,18 @@ class MemoryRevision(SQLModel, table=True):
     actor: Optional[str] = Field(default=None, index=True)
     source_ids_json: Optional[str] = None
     idempotency_key: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class MemoryUseEvent(SQLModel, table=True):
+    """Bounded pilot telemetry, deliberately outside searchable memory captures."""
+    id: str = Field(primary_key=True)
+    user_id: str = Field(index=True)
+    kind: str = Field(index=True)
+    parent_id: Optional[str] = Field(default=None, foreign_key='memoryuseevent.id', index=True)
+    client: str
+    project_slug: Optional[str] = None
+    query_hash: Optional[str] = None
+    capture_ids_json: str = '[]'
+    rule_ids_json: str = '[]'
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)

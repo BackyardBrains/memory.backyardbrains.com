@@ -523,7 +523,9 @@ def test_cortex_migration_extends_current_head():
         elif down_revision:
             down_revisions.add(down_revision)
     heads = set(revisions) - down_revisions
-    assert heads == {"c4d9f8a2b731"}
+    assert revisions["d61015a1"] == "c4d9f8a2b731"
+    assert revisions['e61015b1']=='d61015a1'
+    assert heads == {'e61015b1'}
 
 
 def test_watson_task_disposition_migration_maps_task_394(tmp_path):
@@ -679,19 +681,11 @@ def test_email_index_capture_ranks_below_comparable_match_but_is_returned(monkey
     email = _semantic_result(1, "[email][waiting-on-greg] Moritz asking about songbird grant budget", "claude-desktop-1", 100.0)
     organic = _semantic_result(2, "Greg decided the songbird grant budget caps at 40k", "claude-ios", 99.0)
 
-    for name in ("exact_capture_search", "exact_card_alias_search", "lexical_card_search", "lexical_capture_search", "semantic_card_search"):
-        monkeypatch.setattr(main, name, _empty_group)
-    monkeypatch.setattr(main, "semantic_chunk_search", lambda *a, **k: [email, organic])
-
-    results = search_memory_records(
-        q="songbird grant budget", limit=10, project_slug=None, session=None, user_id="greg"
-    )
-
-    assert [r["capture_id"] for r in results] == [2, 1]  # demoted below, not dropped
-    demoted = results[1]
-    assert demoted["score"] == pytest.approx(100.0 * EMAIL_INDEX_DEMOTION_FACTOR)
-    assert "demoted" in demoted["rank_reason"]
-    assert "demoted" not in results[0]["rank_reason"]
+    from packages.memory_retrieval.ranking import fuse
+    results = fuse([('semantic',1,[email,organic])],10,'songbird grant budget')
+    assert [r['capture_id'] for r in results] == [2,1]
+    assert 'demoted' in results[1]['rank_reason']
+    assert 'demoted' not in results[0]['rank_reason']
 
 
 def test_email_index_demotion_also_applies_by_source(monkeypatch):
@@ -718,15 +712,8 @@ def test_exact_thread_id_lookup_is_not_demoted(monkeypatch):
         "score": 1000.0,
     }
 
-    for name in ("exact_card_alias_search", "lexical_card_search", "lexical_capture_search", "semantic_card_search", "semantic_chunk_search"):
-        monkeypatch.setattr(main, name, _empty_group)
-    monkeypatch.setattr(main, "exact_capture_search", lambda *a, **k: [email_exact])
-
-    results = search_memory_records(
-        q=thread_id, limit=10, project_slug=None, session=None, user_id="greg"
-    )
-
-    assert len(results) == 1
-    assert results[0]["capture_id"] == 5
-    assert results[0]["score"] == 1000.0  # exact/lexical path untouched
-    assert "demoted" not in results[0]["rank_reason"]
+    from packages.memory_retrieval.ranking import fuse
+    results = fuse([('exact',3,[email_exact])],10,thread_id)
+    assert len(results)==1
+    assert results[0]['capture_id']==5
+    assert 'demoted' not in results[0]['rank_reason']

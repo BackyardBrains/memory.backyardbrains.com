@@ -1,0 +1,2 @@
+# Unified patches contain a leading context space on otherwise blank lines.
+integrations/openclaw/*.patch -whitespace

@@ -1,0 +1,19 @@
+[Unit]
+Description=Retry Watson indexing and fill missing evidence cards
+After=memory.backyardbrains.com.service docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/var/www/memory.backyardbrains.com
+EnvironmentFile=/root/memory-api-database.env
+Environment=PYTHONPATH=/var/www/memory.backyardbrains.com
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=OMP_NUM_THREADS=2
+ExecStart=/var/www/memory.backyardbrains.com/venv/bin/python -m scripts.retry_memory_index --seconds 45 --limit 500
+Nice=10
+CPUQuota=150%
+MemoryMax=2G
+TimeoutStartSec=90

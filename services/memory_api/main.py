@@ -1,5 +1,7 @@
 """Memory API: versioned HTTP/JSON domain API with API Key authentication."""
 
+import hashlib
+
 import json
 import os
 import re
@@ -9,10 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
+from sqlalchemy.exc import IntegrityError
 
 from db.engine import engine, init_db
 from db.schema import Capture, Chunk, Event, Link, MemoryFactCard, MemoryRevision, Person, Project, Task
@@ -20,6 +23,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from packages.memory_retrieval.indexer import process_capture, upsert_capture_chunk
 from packages.memory_retrieval.embeddings import compute_embedding
+from packages.memory_retrieval.intake import intake_metadata, project_slug as normalize_memory_project
 
 from services.memory_mcp.server import mcp
 mcp_app = mcp.http_app(path="/")
@@ -83,6 +87,14 @@ class CaptureBody(BaseModel):
     content_hash: str | None = None
     import_batch_id: str | None = None
     historical_until_verified: bool = False
+    source_event_id: str | None = None
+    event_type: str | None = None
+    idempotency_key: str | None = None
+    memory_visibility: str | None = None
+    project_slug: str | None = None
+    policy_scope: str | None = None
+    supersedes_capture_ids: list[int] = []
+    revision_reason: str | None = None
 
 
 class CapturePatchBody(BaseModel):
@@ -104,6 +116,9 @@ class CapturePatchBody(BaseModel):
     idempotency_key: str | None = None
     expected_revision: int | None = None
     reindex: bool = True
+    memory_visibility: str | None = None
+    project_slug: str | None = None
+    policy_scope: str | None = None
 
 
 class CaptureDeleteBody(BaseModel):
@@ -439,7 +454,9 @@ def service_metadata() -> dict:
         "git_branch": os.getenv("GIT_BRANCH") or _git_value("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty_worktree": dirty,
         "deployed_at": os.getenv("DEPLOYED_AT"),
-        "version": "2026.06.10-memory-corrections",
+        "version": "2026.10.15-memory-reliability",
+        "idempotent_capture_enabled": True,
+        "scoped_rules_enabled": True,
         "canonical_memory": MEMORY_SYSTEM,
         "hybrid_search_enabled": True,
         "sync_capture_enabled": True,
@@ -680,6 +697,8 @@ def _agent_capture(
         source_path=f"agents/{agent_id}/{source_type}",
         source_type=source_type,
         observed_at=observed_at,
+        **intake_metadata(_json_dumps(payload), f"agent:{agent_id}", source_type=source_type,
+                          source_path=f"agents/{agent_id}/{source_type}", observed_at=observed_at),
     )
 
 
@@ -718,6 +737,7 @@ CAPTURE_REVISION_FIELDS = (
     "content_hash",
     "import_batch_id",
     "historical_until_verified",
+    "memory_visibility", "project_slug", "policy_scope", "index_state",
 )
 CARD_REVISION_FIELDS = (
     "source_capture_id",
@@ -844,27 +864,13 @@ def _capture_response(capture: Capture, action: str, revision_id: int | None = N
 def get_user_from_api_key(
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> str:
-    """Extract user_id from API key. Keys must match sk_byb_{user_id}_* pattern."""
-    if not x_api_key or not x_api_key.startswith(API_KEY_PREFIX):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid API key. Use X-API-Key: sk_byb_{user_id}_...",
-        )
-    parts = x_api_key[len(API_KEY_PREFIX) :].split("_", 1)
-    user_id = parts[0] if parts else ""
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key format.",
-        )
-    # Optionally validate against a store of allowed keys
-    allowed = os.getenv("MEMORY_API_KEYS", "").split(",")
-    if allowed and allowed[0] and x_api_key not in [k.strip() for k in allowed if k.strip()]:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API key not authorized.",
-        )
-    return user_id
+    from services.memory_api.api_keys import KeyRegistryError, authenticate_key
+    try:
+        return authenticate_key(x_api_key)
+    except KeyRegistryError as exc:
+        if str(exc) == "UNAUTHORIZED":
+            raise HTTPException(status_code=401, detail="Missing or unauthorized Memory API key.") from None
+        raise HTTPException(status_code=503, detail="Memory API key configuration is unavailable.") from None
 
 
 def get_db_session():
@@ -892,6 +898,91 @@ def health():
     return service_metadata()
 
 
+@app.get("/v1/key-info")
+def api_key_info(x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+                 user_id: str = Depends(get_user_from_api_key)):
+    from services.memory_api.api_keys import key_id
+    return {"keyId": key_id(x_api_key), "memoryOwner": user_id, "managedKeys": bool(os.getenv("MEMORY_API_KEYS_FILE"))}
+
+
+@app.get("/v1/rules")
+def current_rules(project_slug: str | None = None,
+                  session: Session = Depends(get_db_session),
+                  user_id: str = Depends(get_user_from_api_key)):
+    """Return active standing instructions without a recency cutoff."""
+    from packages.memory_retrieval.curation import active_rules
+    return active_rules(session, user_id, project_slug)
+
+
+@app.get("/v1/maintenance/health")
+def memory_quality_health(session: Session = Depends(get_db_session), user_id: str = Depends(get_user_from_api_key)):
+    counts = dict(session.execute(text("""
+        SELECT count(*) AS captures,
+          count(*) FILTER(WHERE memory_status='active') AS active,
+          count(*) FILTER(WHERE memory_status='duplicate') AS archived_duplicates,
+          count(*) FILTER(WHERE memory_status='active' AND index_state='error') AS indexing_errors,
+          count(*) FILTER(WHERE memory_status='active' AND index_state='queued' AND created_at < now()-interval '10 minutes') AS indexing_overdue,
+          count(*) FILTER(WHERE memory_status='active' AND memory_visibility='policy') AS active_rules,
+          count(*) FILTER(WHERE memory_status='active' AND memory_visibility IN ('operational_audit','automation_heartbeat')) AS operational_records
+        FROM capture WHERE user_id=:user_id
+    """), {"user_id": user_id}).mappings().one())
+    counts['unindexed_active'] = session.execute(text("""
+        SELECT count(*) FROM capture c LEFT JOIN (SELECT DISTINCT capture_id FROM chunk) ch ON ch.capture_id=c.id
+        WHERE c.user_id=:user_id AND c.memory_status='active' AND ch.capture_id IS NULL
+    """), {"user_id": user_id}).scalar_one()
+    counts['duplicate_event_groups'] = session.execute(text("""
+        SELECT count(*) FROM (SELECT source,event_type,source_event_id,raw_content FROM capture
+        WHERE user_id=:user_id AND memory_status='active' AND source_event_id IS NOT NULL
+        GROUP BY source,event_type,source_event_id,raw_content HAVING count(*)>1) d
+    """), {"user_id": user_id}).scalar_one()
+    counts['event_identity_conflicts'] = session.execute(text("""
+        SELECT count(*) FROM (SELECT source,event_type,source_event_id FROM capture
+        WHERE user_id=:user_id AND memory_status='active' AND source_event_id IS NOT NULL
+          AND event_type<>'cortex-feedback-ack-rejected'
+        GROUP BY source,event_type,source_event_id HAVING count(DISTINCT raw_content)>1) d
+    """), {"user_id": user_id}).scalar_one()
+    from packages.memory_retrieval.curation import current_cards,CURATED_SOURCE
+    reviewed_total=session.execute(text("SELECT count(*) FROM memoryfactcard m JOIN capture c ON c.id=m.source_capture_id WHERE c.user_id=:user_id AND c.memory_status='active' AND m.memory_status='active' AND m.source_system=:source"),dict(user_id=user_id,source=CURATED_SOURCE)).scalar_one()
+    counts['reviewed_decisions']=reviewed_total
+    counts['reviewed_decisions_needing_review']=reviewed_total-sum(len(v) for v in current_cards(session,user_id).values())
+    return {"status": "needs_review" if counts['indexing_errors'] or counts['indexing_overdue'] or counts['unindexed_active'] or counts['duplicate_event_groups'] or counts['reviewed_decisions_needing_review'] else "ok", **counts}
+
+
+@app.get('/v1/context')
+def memory_context(q: str = Query(default='',max_length=2000),
+                   project_slug: str | None = None,
+                   client: str = Query(default='unknown',min_length=1,max_length=80),
+                   session: Session = Depends(get_db_session),
+                   user_id: str = Depends(get_user_from_api_key)):
+    from packages.memory_retrieval.context import context_packet
+    return context_packet(session,user_id,q,project_slug,client)
+
+
+class MemoryFeedbackBody(BaseModel):
+    context_id: str
+    outcome: str
+    capture_ids: list[int] = []
+
+    @field_validator('capture_ids')
+    @classmethod
+    def bounded_evidence(cls,value):
+        if len(value)>100:raise ValueError('At most 100 evidence IDs')
+        return value
+
+
+@app.post('/v1/feedback')
+def memory_feedback(body: MemoryFeedbackBody,session: Session = Depends(get_db_session),
+                    user_id: str = Depends(get_user_from_api_key)):
+    from packages.memory_retrieval.context import record_feedback
+    return record_feedback(session,user_id,body.context_id,body.outcome,body.capture_ids)
+
+
+@app.get('/v1/maintenance/pilot')
+def memory_pilot(session: Session = Depends(get_db_session),user_id: str = Depends(get_user_from_api_key)):
+    from packages.memory_retrieval.context import pilot_metrics
+    return pilot_metrics(session,user_id)
+
+
 @app.get("/v1/agents")
 def list_agents(
     session: Session = Depends(get_db_session),
@@ -915,9 +1006,15 @@ def publish_agent_profile(
         user_id=user_id,
     )
     session.add(capture)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        key = capture.ingestion_key
+        session.rollback()
+        capture = session.exec(select(Capture).where(Capture.user_id == user_id, Capture.ingestion_key == key)).one()
     session.refresh(capture)
-    background_tasks.add_task(process_capture, capture.id)
+    if capture.index_state != "ready":
+        background_tasks.add_task(process_capture, capture.id)
     return {
         "ok": True,
         "agent_id": body.agent_id,
@@ -950,9 +1047,15 @@ def publish_agent_dashboard_status(
         user_id=user_id,
     )
     session.add(capture)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        key = capture.ingestion_key
+        session.rollback()
+        capture = session.exec(select(Capture).where(Capture.user_id == user_id, Capture.ingestion_key == key)).one()
     session.refresh(capture)
-    background_tasks.add_task(process_capture, capture.id)
+    if capture.index_state != "ready":
+        background_tasks.add_task(process_capture, capture.id)
     return {
         "ok": True,
         "agent_id": body.agent_id,
@@ -1251,6 +1354,7 @@ def create_capture(
     background_tasks: BackgroundTasks,
     sync: bool = False,
     verify_q: str | None = None,
+    idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key"),
     session: Session = Depends(get_db_session),
     user_id: str = Depends(get_user_from_api_key),
 ):
@@ -1260,6 +1364,19 @@ def create_capture(
         raise HTTPException(status_code=422, detail={"message": "Capture rejected", "reason": reason})
 
     safe_content = redact_secrets(body.raw_content)
+    if idempotency_key_header and body.idempotency_key and idempotency_key_header != body.idempotency_key:
+        raise HTTPException(status_code=422, detail="Conflicting idempotency keys")
+    try:
+        metadata = intake_metadata(
+            safe_content, body.source, source_event_id=body.source_event_id,
+            event_type=body.event_type, idempotency_key=idempotency_key_header or body.idempotency_key,
+            source_path=body.source_path, observed_at=body.observed_at, source_type=body.source_type,
+            visibility=body.memory_visibility, project=body.project_slug, policy_scope=body.policy_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if body.supersedes_capture_ids and not (body.revision_reason or "").strip():
+        raise HTTPException(status_code=422, detail="revision_reason is required when superseding memories")
     capture = Capture(
         raw_content=safe_content,
         source=body.source,
@@ -1269,29 +1386,75 @@ def create_capture(
         source_type=body.source_type,
         observed_at=body.observed_at,
         imported_at=body.imported_at,
-        content_hash=body.content_hash,
         import_batch_id=body.import_batch_id,
         historical_until_verified=body.historical_until_verified,
+        **metadata,
     )
     session.add(capture)
-    session.commit()
+    duplicate = False
+    try:
+        session.flush()
+        for old_id in set(body.supersedes_capture_ids):
+            if old_id == capture.id:
+                raise HTTPException(status_code=422, detail="A capture cannot supersede itself")
+            old = _get_owned_capture(session, old_id, user_id)
+            if old.memory_status != "active":
+                raise HTTPException(status_code=409, detail="Supersession target is no longer active")
+            before = revision_snapshot(old, CAPTURE_REVISION_FIELDS)
+            old.memory_status = "superseded"
+            old.superseded_by_capture_id = capture.id
+            now = _utcnow()
+            _touch_capture_revision(old, now=now, reason=body.revision_reason, actor=user_id, source_message_ids=[f"capture:{capture.id}"])
+            session.add(old)
+            _mark_derived_cards(session, capture=old, status_value="superseded", now=now,
+                                reason=body.revision_reason, actor=user_id,
+                                source_message_ids=[f"capture:{capture.id}"], idempotency_key=None)
+            _record_revision(session, target_type="capture", target_id=old_id, user_id=user_id,
+                             action="update", before=before, after=revision_snapshot(old, CAPTURE_REVISION_FIELDS),
+                             reason=body.revision_reason, actor=user_id, source_message_ids=[f"capture:{capture.id}"], idempotency_key=None)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        capture = session.exec(select(Capture).where(Capture.user_id == user_id, Capture.ingestion_key == metadata['ingestion_key'])).first()
+        if not capture:
+            raise
+        if capture.raw_content != safe_content:
+            raise HTTPException(status_code=409, detail={"message": "Event identity already exists with different content; use an explicit revision", "capture_id": capture.id})
+        duplicate = True
     session.refresh(capture)
 
+    if duplicate and capture.memory_status != "active":
+        data = capture.model_dump()
+        data.update(capture_id=capture.id, duplicate=True, indexed=capture.index_state == "ready",
+                    verified=False, status="existing_inactive_memory", memory_system=MEMORY_SYSTEM)
+        return data
+
     if not sync:
-        background_tasks.add_task(process_capture, capture.id)
+        if capture.index_state != "ready":
+            background_tasks.add_task(process_capture, capture.id)
         data = capture.model_dump()
         data.update(
             {
                 "capture_id": capture.id,
-                "indexed": False,
+                "indexed": capture.index_state == "ready",
                 "verified": False,
-                "status": "queued_for_indexing",
+                "status": "existing_capture" if duplicate else "queued_for_indexing",
+                "duplicate": duplicate,
                 "memory_system": MEMORY_SYSTEM,
             }
         )
         return data
 
-    process_capture(capture.id)
+    if capture.index_state != "ready":
+        try:
+            process_capture(capture.id)
+        except Exception:
+            session.refresh(capture)
+            data = capture.model_dump()
+            data.update(capture_id=capture.id, duplicate=duplicate, indexed=False, verified=False,
+                        status="stored_pending_index_retry", memory_system=MEMORY_SYSTEM)
+            return data
+    session.refresh(capture)
     chunks = list(session.exec(select(Chunk).where(Chunk.capture_id == capture.id)).all())
     verification_query = verify_q or choose_verification_query(safe_content)
     verification_results = search_memory_records(
@@ -1300,13 +1463,15 @@ def create_capture(
         project_slug=None,
         session=session,
         user_id=user_id,
-        include_semantic=not is_identifier_query(verification_query),
+        include_semantic=False,
+        include_operational=True,
     )
     verified_match = next((row for row in verification_results if row.get("capture_id") == capture.id), None)
     data = capture.model_dump()
     data.update(
         {
             "capture_id": capture.id,
+            "duplicate": duplicate,
             "indexed": bool(chunks),
             "verified": bool(verified_match),
             "verification_query": verification_query,
@@ -1330,6 +1495,10 @@ def get_capture(
     data = capture.model_dump()
     data["capture_id"] = capture.id
     data["memory_system"] = MEMORY_SYSTEM
+    if capture.superseded_by_capture_id:
+        canonical = session.get(Capture, capture.superseded_by_capture_id)
+        if canonical and canonical.user_id == user_id:
+            data["canonical_capture"] = {"id": canonical.id, "capture_id": canonical.id, "raw_content": canonical.raw_content, "memory_status": canonical.memory_status}
     return data
 
 
@@ -1346,6 +1515,9 @@ CAPTURE_PATCH_FIELDS = {
     "historical_until_verified",
     "memory_status",
     "superseded_by_capture_id",
+    "memory_visibility",
+    "project_slug",
+    "policy_scope",
 }
 
 
@@ -1467,6 +1639,7 @@ def patch_capture(
     user_id: str = Depends(get_user_from_api_key),
 ):
     """Correct, supersede, retract, or otherwise revise a memory capture."""
+    session.execute(text("SELECT pg_advisory_xact_lock(61015, :id)"), {"id": capture_id})
     capture = _get_owned_capture(session, capture_id, user_id)
     existing_revision = _existing_revision_for_key(
         session,
@@ -1500,6 +1673,7 @@ def patch_capture(
             raise HTTPException(status_code=422, detail={"message": "Capture update rejected", "reason": reject_reason})
         content_changed = safe_content != capture.raw_content
         capture.raw_content = safe_content
+        capture.content_hash = hashlib.sha256(safe_content.encode()).hexdigest()
 
     if "source" in patch_values:
         source_value = (patch_values["source"] or "").strip()
@@ -1515,9 +1689,20 @@ def patch_capture(
         "imported_at",
         "content_hash",
         "import_batch_id",
+        "project_slug",
+        "policy_scope",
+        "memory_visibility",
     ):
         if field in patch_values:
             setattr(capture, field, patch_values[field])
+
+    if capture.memory_visibility not in {"knowledge", "policy", "operational_audit", "automation_heartbeat"}:
+        raise HTTPException(status_code=422, detail="Invalid memory_visibility")
+    if capture.policy_scope not in {None, "global", "project"}:
+        raise HTTPException(status_code=422, detail="Invalid policy_scope")
+    capture.project_slug = normalize_memory_project(capture.project_slug)
+    if capture.policy_scope == "project" and not capture.project_slug:
+        raise HTTPException(status_code=422, detail="Project policy requires project_slug")
 
     if "historical_until_verified" in patch_values:
         if patch_values["historical_until_verified"] is None:
@@ -1570,8 +1755,11 @@ def patch_capture(
             idempotency_key=body.idempotency_key,
         )
 
-    if content_changed and capture.memory_status == ACTIVE_MEMORY_STATUS and body.reindex:
+    index_changed = content_changed or any(k in patch_values for k in ("memory_visibility", "project_slug", "policy_scope"))
+    if index_changed and capture.memory_status == ACTIVE_MEMORY_STATUS and body.reindex:
         upsert_capture_chunk(session, capture)
+    elif index_changed:
+        capture.index_state = "queued"
 
     revision = _record_revision(
         session,
@@ -1606,6 +1794,7 @@ def delete_capture(
 ):
     """Soft-delete a memory capture by tombstoning it and its derived cards."""
     body = body or CaptureDeleteBody()
+    session.execute(text("SELECT pg_advisory_xact_lock(61015, :id)"), {"id": capture_id})
     capture = _get_owned_capture(session, capture_id, user_id)
     existing_revision = _existing_revision_for_key(
         session,
@@ -2218,7 +2407,6 @@ def lexical_capture_search(
           {visibility_sql}
           AND (
             to_tsvector('simple', coalesce(c.raw_content, '')) @@ plainto_tsquery('simple', :q)
-            OR similarity(c.raw_content, :q) > 0.08
           )
         ORDER BY
           ts_rank(to_tsvector('simple', coalesce(c.raw_content, '')), plainto_tsquery('simple', :q)) DESC,
@@ -2340,11 +2528,14 @@ def merge_search_results(groups: list[list[dict]], limit: int) -> list[dict]:
 def is_historical_import_result(item: dict) -> bool:
     source = str(item.get("source") or "").lower()
     historical_status = str(item.get("historical_status") or "").lower()
+    memory_visibility = str(item.get("memory_visibility") or "").lower()
     return bool(
         item.get("historical_until_verified")
         or is_inactive_memory_status(item.get("memory_status"))
         or source.startswith("historical-import")
-        or historical_status in {"historical", "legacy", "archived", "stale", "superseded"}
+        or historical_status.startswith("historical")
+        or historical_status in {"legacy", "archived", "stale", "superseded"}
+        or memory_visibility == "historical_evidence"
     )
 
 
@@ -2387,41 +2578,11 @@ def search_memory_records(
     include_semantic: bool = True,
     include_operational: bool | None = None,
 ) -> list[dict]:
+    from packages.memory_retrieval.ranking import search_records
     bounded_limit = max(1, min(int(limit), 200))
-    query = (q or "").strip()
-    include_operational = _query_requests_operational_memory(query) if include_operational is None else include_operational
-    if not query:
-        return recent_capture_records(bounded_limit, project_slug, session, user_id, include_operational)
-
-    exact = exact_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-    exact_current, exact_historical = split_historical_import_results(exact)
-    card_exact = exact_card_alias_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-    card_lexical = lexical_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-    card_semantic = []
-    lexical = lexical_capture_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-    lexical_current, lexical_historical = split_historical_import_results(lexical)
-    semantic = []
-    if include_semantic:
-        try:
-            card_semantic = demote_email_index_results(
-                semantic_card_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-            )
-            semantic = demote_email_index_results(
-                semantic_chunk_search(query, bounded_limit, project_slug, session, user_id, include_operational)
-            )
-        except Exception:
-            session.rollback()
-            card_semantic = []
-            semantic = []
-    if is_identifier_query(query):
-        return merge_search_results(
-            [exact_current, card_exact, exact_historical, lexical_current, card_lexical, card_semantic, lexical_historical, semantic],
-            bounded_limit,
-        )
-    return merge_search_results(
-        [exact_current, card_exact, card_lexical, card_semantic, exact_historical, lexical_current, lexical_historical, semantic],
-        bounded_limit,
-    )
+    operational = _query_requests_operational_memory(q) if include_operational is None else include_operational
+    return search_records(q, bounded_limit, project_slug, session, user_id,
+                          include_semantic=include_semantic, include_operational=operational)
 
 
 @app.get("/v1/search")

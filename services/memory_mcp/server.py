@@ -5,15 +5,24 @@ from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_request
 
-# Memory API base URL (e.g., http://localhost:8001 when API runs there)
-MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://localhost:8001")
+# Memory API base URL (e.g., http://127.0.0.1:8002 when API runs there)
+MEMORY_API_URL = os.getenv("MEMORY_API_URL", "http://127.0.0.1:8002")
 # API key for MCP->API calls (format: sk_byb_{user_id}_...)
-MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "sk_byb_greg_local")
+MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
 
 def _api_headers() -> dict:
-    return {"X-API-Key": MEMORY_API_KEY, "Content-Type": "application/json"}
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        key = MEMORY_API_KEY  # Explicit credential for local stdio clients.
+    else:
+        key = request.headers.get("x-api-key", "")
+    if not key:
+        raise ValueError("Memory API authentication required: provide X-API-Key")
+    return {"X-API-Key": key, "Content-Type": "application/json"}
 
 
 def _source_message_ids(value: Optional[str]) -> list[str] | None:
@@ -26,7 +35,10 @@ def _source_message_ids(value: Optional[str]) -> list[str] | None:
 mcp = FastMCP(
     name="Memory MCP",
     instructions=(
-        "BYB Shared Memory service. Use byb_memory_search for canonical recall and "
+        "BYB Shared Memory service. Start with byb_memory_context using the task question and project; "
+        "apply its current rules and cite the evidence used. Related evidence is not proof of an answer. "
+        "Use byb_memory_feedback only for actual use or observed misses; loading context is not compliance. "
+        "Use byb_memory_search for canonical recall and "
         "byb_memory_capture_verified for durable user memory. Use byb_memory_patch_capture "
         "or byb_memory_delete_capture to correct, supersede, retract, or tombstone stale "
         "captures with a reason and source message IDs. Do not claim a note was saved "
@@ -71,7 +83,7 @@ def byb_memory_search(
         return "\n".join(
             f"- [{c.get('created_at', '')}] system={c.get('memory_system', 'BYB Shared Memory')} "
             f"match={c.get('match_type', 'unknown')} source={c.get('source', 'unknown')} "
-            f"id={c.get('capture_id', c.get('id', '?'))} {c.get('raw_content', '')}"
+            f"id={c.get('capture_id', c.get('id', '?'))} {c.get('content') or c.get('raw_content', '')}"
             for c in data
         )
     return str(data)
@@ -84,18 +96,62 @@ def capture_note(raw_content: str, source: str = "mcp") -> str:
 
 
 @mcp.tool
-def byb_memory_capture_verified(raw_content: str, source: str = "mcp") -> str:
-    """Save a durable note to BYB Shared Memory and verify read-back before success."""
+def byb_memory_rules(project_slug: Optional[str] = None) -> str:
+    """Load active standing and project instructions, including older corrections."""
+    r = httpx.get(f"{MEMORY_API_URL}/v1/rules", params={"project_slug": project_slug} if project_slug else {}, headers=_api_headers(), timeout=30.0)
+    r.raise_for_status()
+    import json
+    return json.dumps(r.json())
+
+
+@mcp.tool
+def byb_memory_context(query: str = '', project_slug: Optional[str] = None, client: str = 'memory-mcp') -> str:
+    """Start work with all applicable active rules and up to five source-linked evidence excerpts."""
+    import json
+    params={'q':query,'client':client}
+    if project_slug:params['project_slug']=project_slug
+    r=httpx.get(f'{MEMORY_API_URL}/v1/context',params=params,headers=_api_headers(),timeout=30.0)
+    r.raise_for_status()
+    return json.dumps(r.json())
+
+
+@mcp.tool
+def byb_memory_feedback(context_id: str, outcome: str, capture_ids: list[int] | None = None) -> str:
+    """Report observed used/missed/stale/irrelevant/user_repeated/abstained; never infer use from fetching."""
+    import json
+    r=httpx.post(f'{MEMORY_API_URL}/v1/feedback',json=dict(context_id=context_id,outcome=outcome,
+                 capture_ids=capture_ids or []),headers=_api_headers(),timeout=30.0)
+    r.raise_for_status()
+    return json.dumps(r.json())
+
+
+@mcp.tool
+def byb_memory_capture_verified(raw_content: str, source: str = "mcp",
+                               source_event_id: Optional[str] = None,
+                               event_type: Optional[str] = None,
+                               idempotency_key: Optional[str] = None,
+                               observed_at: Optional[str] = None,
+                               project_slug: Optional[str] = None,
+                               memory_visibility: Optional[str] = None) -> str:
+    """Save and verify a durable note. Use event IDs for distinct observations and retry keys for retries."""
+    payload = {"raw_content": raw_content, "source": source}
+    for name, value in (("source_event_id", source_event_id), ("event_type", event_type),
+                        ("idempotency_key", idempotency_key), ("observed_at", observed_at),
+                        ("project_slug", project_slug), ("memory_visibility", memory_visibility)):
+        if value is not None:
+            payload[name] = value
     r = httpx.post(
         f"{MEMORY_API_URL}/v1/captures",
         params={"sync": "true"},
-        json={"raw_content": raw_content, "source": source},
+        json=payload,
         headers=_api_headers(),
         timeout=60.0,
     )
     r.raise_for_status()
     out = r.json()
     capture_id = out.get("capture_id") or out.get("id") or "?"
+    if out.get("memory_status", "active") != "active":
+        return f"Existing capture {capture_id} is {out.get('memory_status')}; no new capture created. Replacement: {out.get('superseded_by_capture_id')}."
     if out.get("verified"):
         return f"Captured and verified in BYB Shared Memory (id={capture_id})."
     if out.get("indexed"):
