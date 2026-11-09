@@ -1,0 +1,307 @@
+--- a/bin/memory
++++ b/bin/memory
+@@ -13,6 +13,9 @@
+ 
+ Usage:
+   memory health
++  memory context --q <task-question> [--project SLUG] [--client NAME]
++  memory rules [--project SLUG]
++  memory feedback --context ID --outcome used --capture-id ID
+   memory get <endpoint> [--query key=value ...]
+   memory search --q <query> [--limit N]
+   memory capture (--content "..." | --stdin | --content-file PATH) [--source NAME] [--project SLUG] [--tags "[tag][tag2]"]
+@@ -279,6 +282,7 @@
+   case "$1" in
+     -h|--help|help) usage; exit 0 ;;
+     health) shift; cmd_health "$@" ;;
++    context|rules|feedback) exec python3 "$(dirname "$(readlink -f "$0")")/../scripts/memory_context_client.py" "$@" ;;
+     get) shift; cmd_get "$@" ;;
+     search) shift; cmd_search "$@" ;;
+     capture) shift; cmd_capture "$@" ;;
+--- a/services/watson.backyardbrains.com/main.py
++++ b/services/watson.backyardbrains.com/main.py
+@@ -352,6 +352,12 @@
+     }
+ 
+ 
++def memory_context(q: str = Query('',max_length=2000),project_slug: str | None = None):
++    if not USE_MEMORY_API:raise HTTPException(422,'Memory API is disabled')
++    from memory_client import get_memory_context
++    return get_memory_context(q,project_slug,'watson-rest')
++
++
+ class MemoryAuditPayload(BaseModel):
+     limit: int = 200
+     apply_quarantine: bool = False
+@@ -520,7 +526,7 @@
+ 
+ 
+ # --- MCP Server (auth via privateKey param, no Bearer) ---
+-mcp = FastMCP("Watson")
++mcp = FastMCP("Watson",instructions='Before BYB work, call get_memory_context with the task question and project. Apply all active rules, cite source evidence, and state what is unknown. Retrieval alone does not prove compliance. Record feedback only after actual use or an observed miss.')
+ 
+ 
+ def _get_summary_data():
+@@ -582,6 +588,24 @@
+         "captures": search_captures(q=q, limit=max(1, min(int(limit), 200)), include_quarantined=include_quarantined),
+         "include_quarantined": include_quarantined,
+     }
++
++
++@mcp.tool(annotations=READ_ONLY, meta=META_SAFE)
++def get_memory_context(privateKey: str | None = None,q: str = '',project_slug: str | None = None) -> dict:
++    """Start a task with current rules and relevant source excerpts; fetching does not prove compliance."""
++    _verify_private_key(privateKey)
++    if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
++    from memory_client import get_memory_context as get_context
++    return get_context(q,project_slug,'watson-mcp')
++
++
++@mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
++def record_memory_feedback(context_id: str,outcome: str,capture_ids: list[int],privateKey: str | None = None) -> dict:
++    """Report actual use or an observed miss; private telemetry, not a durable capture."""
++    _verify_private_key(privateKey)
++    if not USE_MEMORY_API:raise ValueError('Memory API is disabled')
++    from memory_client import record_memory_feedback as record
++    return record(context_id,outcome,capture_ids)
+ 
+ 
+ @mcp.tool(annotations=WRITE_APPEND, meta=META_SAFE)
+@@ -1040,6 +1064,7 @@
+ app.get("/links", dependencies=[Depends(verify_secret)])(links)
+ app.post("/inbox", dependencies=[Depends(verify_secret)])(inbox)
+ app.get("/memory/search", dependencies=[Depends(verify_secret)])(memory_search)
++app.get("/memory/context", dependencies=[Depends(verify_secret)])(memory_context)
+ app.post("/memory/audit", dependencies=[Depends(verify_secret)])(memory_audit)
+ app.get("/memory/quality", dependencies=[Depends(verify_secret)])(memory_quality)
+ app.get("/files/{name}")(get_file)
+--- a/services/watson.backyardbrains.com/memory_client.py
++++ b/services/watson.backyardbrains.com/memory_client.py
+@@ -716,6 +716,16 @@
+     return visible[:requested]
+ 
+ 
++def get_memory_context(q: str = '', project_slug: str | None = None, client: str = 'watson') -> dict:
++    params={'q':q,'client':client}
++    if project_slug:params['project_slug']=project_slug
++    return _get('/v1/context',params)
++
++
++def record_memory_feedback(context_id: str,outcome: str,capture_ids: list[int]) -> dict:
++    return _post('/v1/feedback',dict(context_id=context_id,outcome=outcome,capture_ids=capture_ids))
++
++
+ def _collect_audit_captures(limit: int = 200, queries: list[str] | None = None) -> list[dict]:
+     seen: set[str] = set()
+     captures: list[dict] = []
+--- a/scripts/telemetry/log_routine_run_codex.py
++++ b/scripts/telemetry/log_routine_run_codex.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Log token usage + Watson-memory compliance for a codex-run routine.
++"""Log token usage and observed memory tool attempts for a Codex routine.
+ 
+ Codex twin of log_routine_run.py, called by run_routine_codex.sh after the
+ codex exec process exits. Finds the rollout transcript the run produced
+@@ -8,11 +8,9 @@
+ token_count event, and appends a JSON line to telemetry/routine_runs.jsonl
+ compatible with the Claude rows (extra codex-specific fields are additive).
+ 
+-Why compliance fields: Greg's observation is that GPT runs skip the Watson
+-memory protocol that Claude follows. We count actual exec_command calls that
+-hit the Memory/Watson APIs (prompt text that merely quotes the URLs is not
+-counted) and set memory_compliant=false when the run searched nothing —
+-a correct run always searches at least once (Step 3 manager pulse).
++Tool-call text can establish an attempted memory read. It cannot establish a
++successful response, evidence use, or instruction compliance. Those are kept
++separate from this counter; the memory pilot collects source-linked feedback.
+ 
+ Costs are API-equivalent dollars at gpt-5-family list rates (the ChatGPT
+ subscription bills allowance, not dollars; the equivalent keeps the scorecard
+@@ -65,12 +63,14 @@
+             ):
+                 cmd = str(p.get("arguments") or "") + str(p.get("input") or "")
+                 if MEMORY_HOST in cmd:
+-                    if "/v1/search" in cmd:
++                    if "/v1/search" in cmd or ("/v1/context" in cmd and ('q=' in cmd or '"q"' in cmd)):
+                         searches += 1
+                     if "/v1/captures" in cmd:
+                         captures += 1
+                 if WATSON_HOST in cmd:
+                     watson += 1
++                if 'memory context --q' in cmd or 'memory search --q' in cmd or 'byb_memory_context' in cmd or 'get_memory_context' in cmd:
++                    searches += 1
+     return found, last_tc, turns, searches, captures, watson
+ 
+ 
+@@ -108,7 +108,7 @@
+     limits = (last_tc or {}).get("rate_limits") or {}
+     weekly = (limits.get("primary") or {}).get("used_percent")
+ 
+-    compliant = searches >= 1 and not (captures > 0 and searches == 0)
++    search_attempt_observed = searches >= 1
+     row = {
+         "ts": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
+         "routine": args.routine,
+@@ -124,7 +124,8 @@
+         "memory_searches": searches,
+         "memory_captures": captures,
+         "watson_calls": watson,
+-        "memory_compliant": compliant,
++        "memory_search_attempt_observed": search_attempt_observed,
++        "memory_compliance_assessment": "not_measured",
+         "codex_weekly_used_percent": weekly,
+         "est_cost_usd": round(cost, 4),
+     }
+@@ -134,9 +135,9 @@
+     print(
+         f"cost: ≈${cost:.2f} ({args.model} via codex, {turns} turns, out={out/1000:.0f}k, "
+         f"cached={cached/1e6:.1f}M) memory: searches={searches} captures={captures} "
+-        f"watson={watson} compliant={compliant} weekly_used={weekly}%"
++        f"watson={watson} search_attempt_observed={search_attempt_observed} compliance=not_measured weekly_used={weekly}%"
+     )
+-    if not compliant:
++    if not search_attempt_observed:
+         print(
+             f"WARNING: {args.routine} codex run made no Memory API search — "
+             "protocol violation, review the transcript: " + f
+--- a/routines/watson-drafts-commitments.md
++++ b/routines/watson-drafts-commitments.md
+@@ -29,7 +29,7 @@
+ 
+ ## Step 0 — Coach
+ 
+-Memory search q="coach:watson" limit 10. Apply every correction. Greg's
++Load the complete active rules with `memory rules` (already included in the runner's context packet). Apply every correction. Greg's
+ one-line corrections outrank anything in this file.
+ 
+ Closed-item suppression cross-reference: before creating waiting-on-Greg,
+--- a/routines/watson-right-brain-steward.md
++++ b/routines/watson-right-brain-steward.md
+@@ -29,7 +29,7 @@
+ 
+ ## Step 0 — Coach
+ 
+-Memory search q="coach:watson" limit 10. Apply every correction found.
++Load the complete active rules with `memory rules` (already included in the runner's context packet). Apply every correction found.
+ 
+ Closed-item suppression cross-reference: before reconciling, patching, or
+ publishing any task, project, or dashboard item, apply the morning brief's
+--- a/routines/watson-hourly-check.md
++++ b/routines/watson-hourly-check.md
+@@ -30,7 +30,7 @@
+ 
+ ## Step 0 — Coach
+ 
+-Memory search q="coach:watson" limit 5. Apply every correction found. Greg's
++Load the complete active rules with `memory rules` (already included in the runner's context packet). Apply every correction found. Greg's
+ one-line corrections outrank anything in this file.
+ 
+ Closed-item suppression cross-reference: before surfacing, capturing, pinging,
+--- a/routines/watson-morning-briefing.md
++++ b/routines/watson-morning-briefing.md
+@@ -30,7 +30,7 @@
+ 
+ ## Coach first (mandatory, before anything else)
+ 
+-Memory search q="coach:watson" limit 10. Apply every correction found there to
++Load the complete active rules with `memory rules` (already included in the runner's context packet). Apply every correction found there to
+ today's briefing. Greg's one-line corrections outrank any instruction in this file
+ about style, length, or content. If the same correction appears twice, tag your
+ capture [harness-bug] so the weekly clinic patches this routine.
+@@ -44,7 +44,7 @@
+ Step 1 - build the kill list. Memory searches, every run:
+   q="[suppress]" limit 50
+   q="status-change" limit 50
+-  q="coach:watson" limit 15 and q="coach:spike" limit 15
++  all active rules via `memory rules`, plus q="coach:spike" limit 15 for any additional agent-specific context
+ Captures tagged [suppress] are an explicit permanent ban list written by Spike
+ and Greg. Treat every [suppress] capture as an absolute veto on its subject.
+ 
+--- a/workspaces/editorial/AGENTS.md
++++ b/workspaces/editorial/AGENTS.md
+@@ -3,6 +3,8 @@
+ This workspace owns BYB's blog/newsletter idea pipeline and draft preparation.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client editorial` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ Before doing work:
+ 
+--- a/workspaces/ops/AGENTS.md
++++ b/workspaces/ops/AGENTS.md
+@@ -5,6 +5,8 @@
+ Run health-check commands **one at a time** — exactly **one** `exec` tool call per turn. Never batch checks in parallel (causes `file lock stale` false failures). For Docker (check 3), SKIP — see SOUL.md; do not run `docker compose ps`.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client ops` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ 1. Read `SOUL.md` — your identity and health check playbook
+ 2. Hydrate context from Memory API first (`memory search --q "ops health check" --limit 20`)
+--- a/workspaces/marketing/AGENTS.md
++++ b/workspaces/marketing/AGENTS.md
+@@ -7,6 +7,8 @@
+ If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client marketing` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ Before doing anything else:
+ 
+--- a/workspaces/support/AGENTS.md
++++ b/workspaces/support/AGENTS.md
+@@ -1,6 +1,8 @@
+ # AGENTS.md - Support Workspace
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client support` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ 1. Read `SOUL.md`, `TOOLS.md`, and `HEARTBEAT.md`.
+ 2. Confirm `/corpus` is mounted and writable before any corpus maintenance:
+--- a/workspaces/seo/AGENTS.md
++++ b/workspaces/seo/AGENTS.md
+@@ -3,6 +3,8 @@
+ This workspace owns organic growth analysis and Shopify page experiments.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client seo` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ Before making recommendations or edits:
+ 
+--- a/workspaces/accounting/AGENTS.md
++++ b/workspaces/accounting/AGENTS.md
+@@ -7,6 +7,8 @@
+ If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client accounting` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ Before doing anything else:
+ 
+--- a/workspaces/trading/AGENTS.md
++++ b/workspaces/trading/AGENTS.md
+@@ -3,6 +3,8 @@
+ This workspace owns the Base wallet trading experiment. Treat every live swap as a financial action.
+ 
+ ## Session Startup
++
++Before each task, run `memory context --q "<task question>" --client trading` (add `--project <slug>` when known). Apply the packet's active rules, cite the evidence used, and state missing evidence honestly. A fetch is not proof of compliance. Report an observed miss or repeated user correction with `memory feedback`; do not create routine success captures.
+ 
+ Before proposing or executing a trade:
+ 
+--- a/workspaces/main/AGENTS.md
++++ b/workspaces/main/AGENTS.md
+@@ -1,6 +1,6 @@
+ # AGENTS.md — Spike's working rules
+ 
+-Start of a session: read SOUL.md, USER.md, TOOLS.md and SPIKERBOT.md, then `memory search --q "coach:spike" --limit 10` and apply every correction. That is the whole startup.
++Start of a session: read SOUL.md, USER.md, TOOLS.md and SPIKERBOT.md, then load the complete active rules with `memory context --client spike`. For each task use `memory context --q "<task question>" --client spike` (add `--project <slug>` when known), apply the rules and cite evidence. Search `coach:spike` for additional agent-specific corrections. Loading context alone does not prove compliance.
+ 
+ ## Red lines
+ - Never exfiltrate private data. Private things stay private.
