@@ -32,6 +32,7 @@ class _Session:
         self.task = task
         self.revisions = list(revisions)
         self.added = []
+        self.statements = []
 
     def get(self, model, obj_id):
         if model is Task:
@@ -39,12 +40,15 @@ class _Session:
         return next((project for project in self.projects.values() if project.id == obj_id), None)
 
     def exec(self, stmt):
+        self.statements.append(str(stmt))
         entity = stmt.column_descriptions[0]["entity"]
         if entity is Project:
             slug = stmt.whereclause.right.value
             return _Result([self.projects[slug]] if slug in self.projects else [])
         if entity is MemoryRevision:
             return _Result(self.revisions)
+        if entity is Task:
+            return _Result([self.task] if self.task else [])
         raise AssertionError(f"unexpected query for {entity}")
 
     def add(self, obj):
@@ -139,9 +143,11 @@ def test_project_revisions_are_listed_newest_first_with_before_and_after():
         created_at=datetime(2026, 11, 20, 11, 53),
     )
 
-    resp = _client(_Session(projects=[project], revisions=[revision])).get("/v1/projects/urop/revisions")
+    session = _Session(projects=[project], revisions=[revision])
+    resp = _client(session).get("/v1/projects/urop/revisions")
 
     assert resp.status_code == 200, resp.text
+    assert "ORDER BY memoryrevision.id DESC" in session.statements[-1]
     data = resp.json()
     assert data["slug"] == "urop" and data["lifecycle_state"] == "closed"
     assert data["revisions"][0]["before"] == {"lifecycle_state": "active"}
@@ -189,3 +195,15 @@ def test_patch_task_rejects_edits_it_cannot_apply(body):
 
     assert resp.status_code == 422, resp.text
     assert task.description == "Email MIT Press" and task.project_id is None
+
+
+def test_task_list_asks_for_newest_rows_first():
+    # The fake session cannot sort, so this checks the query itself: with the
+    # 200-row cap, ascending order returned the oldest tasks and cut the new ones.
+    session = _Session(task=Task(id=638, description="Email MIT Press", status="To Do"))
+
+    resp = _client(session).get("/v1/tasks", params={"include_complete": "false", "limit": 200})
+
+    assert resp.status_code == 200, resp.text
+    assert "ORDER BY task.id DESC" in session.statements[-1]
+    assert [row["id"] for row in resp.json()] == [638]
