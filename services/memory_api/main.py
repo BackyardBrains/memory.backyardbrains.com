@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from sqlmodel import Session, select
 from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError
@@ -30,16 +30,12 @@ mcp_app = mcp.http_app(path="/")
 
 PROJECT_LIFECYCLE_STATES = {"active", "closed", "archived"}
 PROJECT_LIST_STATES = PROJECT_LIFECYCLE_STATES | {"open", "all", "any"}
-PROJECT_CLOSED_STATUS_MARKERS = (
-    "closed",
-    "duplicate",
-    "retired",
-    "merged",
-    "archived",
-    "superseded",
-    "obsolete",
-    "cancelled",
-    "canceled",
+# Words a deliberate closure note tends to open with. They only produce a
+# warning now; see _project_lifecycle_from_fields.
+PROJECT_CLOSING_STATUS_RE = re.compile(
+    r"^\W*(?:\d{4}-\d{2}-\d{2}(?:\s+\w+)?\s*:\s*)?"
+    r"(?:closed|duplicate|retired|merged|archived|superseded|obsolete|cancell?ed)\b",
+    re.IGNORECASE,
 )
 
 
@@ -69,11 +65,20 @@ def _project_lifecycle_from_fields(
     priority_value: str | None,
     fallback: str = "active",
 ) -> str:
+    """Lifecycle for a write that did not send lifecycle_state.
+
+    Only priority "Closed" closes a project here. Status prose is never read:
+    matching words inside it closed live projects whenever an update mentioned
+    a merged pull request, a canceled meeting or a disclosed conflict.
+    """
     priority_text = (priority_value or "").strip().lower()
-    status_text = (status_value or "").strip().lower()
-    if priority_text == "closed" or any(marker in status_text for marker in PROJECT_CLOSED_STATUS_MARKERS):
+    if priority_text == "closed":
         return "closed"
     return _normalize_project_lifecycle_state(fallback)
+
+
+def _project_status_reads_closed(status_value: str | None) -> bool:
+    return bool(PROJECT_CLOSING_STATUS_RE.match(status_value or ""))
 
 
 class CaptureBody(BaseModel):
@@ -244,6 +249,10 @@ class TaskBody(BaseModel):
 class TaskStatusBody(BaseModel):
     """PATCH body for tasks. All fields optional; only provided fields are updated."""
     status: str | None = None
+    description: str | None = None
+    due_date: datetime | None = Field(default=None, validation_alias=AliasChoices("due_date", "dueDate"))
+    project_id: int | None = None
+    project_slug: str | None = None
     draft_text: str | None = None
     state: str | None = None
     snooze_until: datetime | None = None
@@ -257,6 +266,7 @@ class TaskStatusBody(BaseModel):
     attention_updated_by: str | None = None
 
     _validate_state = field_validator("state")(_validate_task_state)
+    _parse_due_date = field_validator("due_date", mode="before")(_parse_optional_datetime)
     _parse_snooze_until = field_validator("snooze_until", mode="before")(_parse_optional_datetime)
     _parse_attention_updated_at = field_validator("attention_updated_at", mode="before")(_parse_optional_datetime)
 
@@ -843,6 +853,11 @@ def _project_response(project: Project, *, action: str | None = None, revision_i
         data["revision_id"] = revision_id
     if idempotent:
         data["idempotent"] = True
+    if project.lifecycle_state == "active" and _project_status_reads_closed(project.status):
+        data["warnings"] = [
+            'Status text reads as closed but lifecycle_state is still "active". '
+            'Send lifecycle_state="closed" to close the project.'
+        ]
     return data
 
 
@@ -1114,7 +1129,46 @@ def create_project(
     session.add(proj)
     session.commit()
     session.refresh(proj)
-    return proj
+    return _project_response(proj)
+
+
+@app.get("/v1/projects/{slug}/revisions")
+def list_project_revisions(
+    slug: str,
+    limit: int = 50,
+    session: Session = Depends(get_db_session),
+    user_id: str = Depends(get_user_from_api_key),
+):
+    """Audit history for one project row, newest first."""
+    project = session.exec(select(Project).where(Project.slug == slug)).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    revisions = session.exec(
+        select(MemoryRevision)
+        .where(
+            MemoryRevision.target_type == "project",
+            MemoryRevision.target_id == project.id,
+            MemoryRevision.user_id == user_id,
+        )
+        .order_by(MemoryRevision.id.desc())
+        .limit(max(1, min(limit, 200)))
+    ).all()
+    return {
+        "slug": project.slug,
+        "lifecycle_state": project.lifecycle_state,
+        "revisions": [
+            {
+                "id": revision.id,
+                "created_at": revision.created_at,
+                "action": revision.action,
+                "actor": revision.actor,
+                "reason": revision.reason,
+                "before": json.loads(revision.before_json or "{}"),
+                "after": json.loads(revision.after_json or "{}"),
+            }
+            for revision in revisions
+        ],
+    }
 
 
 @app.patch("/v1/projects/{slug}")
@@ -1226,7 +1280,7 @@ def list_tasks(
                 Task.snooze_until < tomorrow,
             ),
         )
-    stmt = stmt.limit(min(limit, 200))
+    stmt = stmt.order_by(Task.id.desc()).limit(min(limit, 200))
     tasks = list(session.exec(stmt).all())
     if not include_complete:
         tasks = [t for t in tasks if not _is_terminal_task_status(t.status)]
@@ -1940,6 +1994,21 @@ def set_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     patch_values = body.model_dump(exclude_unset=True)
+    if "description" in patch_values and not (patch_values["description"] or "").strip():
+        raise HTTPException(status_code=422, detail="description cannot be blank")
+    if "project_slug" in patch_values:
+        project_slug = (patch_values.pop("project_slug") or "").strip()
+        if project_slug:
+            project = session.exec(select(Project).where(Project.slug == project_slug)).first()
+            if not project:
+                raise HTTPException(status_code=422, detail=f"Project '{project_slug}' not found")
+            if patch_values.get("project_id") not in (None, project.id):
+                raise HTTPException(status_code=422, detail="project_id and project_slug name different projects")
+            patch_values["project_id"] = project.id
+        else:
+            patch_values.setdefault("project_id", None)
+    elif patch_values.get("project_id") is not None and session.get(Project, patch_values["project_id"]) is None:
+        raise HTTPException(status_code=422, detail=f"Project id {patch_values['project_id']} not found")
     if patch_values.get("snooze_until") is not None and "attention_state" not in patch_values:
         patch_values["attention_state"] = "snoozed"
     if "attention_state" not in patch_values and any(
