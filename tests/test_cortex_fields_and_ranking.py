@@ -145,9 +145,10 @@ def test_project_list_state_defaults_to_active():
     assert main._normalize_project_list_state("archived", include_closed=False) == "archived"
 
 
-def test_project_lifecycle_legacy_closed_fields_are_normalized():
+def test_project_lifecycle_follows_explicit_fields_not_status_prose():
     assert main._project_lifecycle_from_fields(status_value="Active", priority_value="Closed") == "closed"
-    assert main._project_lifecycle_from_fields(status_value="Duplicate - closed 2026-06-12", priority_value="High") == "closed"
+    # Status text alone never closes a project, however it is worded.
+    assert main._project_lifecycle_from_fields(status_value="Duplicate - closed 2026-06-12", priority_value="High") == "active"
     assert (
         main._project_lifecycle_from_fields(
             status_value="Work complete. Project kept open due to clawback risk.",
@@ -155,6 +156,7 @@ def test_project_lifecycle_legacy_closed_fields_are_normalized():
         )
         == "active"
     )
+    assert main._project_lifecycle_from_fields(status_value="Still writing", priority_value="Low", fallback="closed") == "closed"
 
 
 def test_project_model_round_trips_new_fields():

@@ -29,8 +29,12 @@ if they are not already exported.
 - Dedup-search before every capture; never write a duplicate.
 - Verify every write by the id in the POST response (there is no status
   readback endpoint).
-- `PATCH /v1/tasks/{id}` silently drops `description` — put evidence in
-  captures, never in task descriptions.
+- `PATCH /v1/tasks/{id}` applies `description`, `due_date` and the project
+  (`project_id` or `project_slug`); an edit it cannot apply returns 422.
+  Evidence still belongs in captures, not in task descriptions.
+- A project closes only with `lifecycle_state="closed"` (or priority `Closed`).
+  Status text alone never closes it; the response warns when a status reads
+  like a closure and the project is still active.
 
 ## Watson service
 

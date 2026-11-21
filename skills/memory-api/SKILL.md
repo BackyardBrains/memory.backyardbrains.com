@@ -33,6 +33,8 @@ When searching, you can scope by:
 
 - **Structured rules** (projects, tasks, events) live in relational tables. Create/update via `upsert_task`, `set_task_status`, `set_task_attention`, etc.
 - Task lifecycle (`status`) is separate from Today eligibility (`attention_state`). Use `status` for existence/completion, and use `attention_state=active|snoozed|deferred` for whether an open task can compete for Greg's attention.
+- A project closes only when a write sends `lifecycle_state="closed"` (or priority `Closed`). Status text is never read for this, so a status that mentions a merged pull request or a canceled meeting leaves the project open. `PATCH /v1/projects/{slug}` returns a `warnings` entry when the status reads like a closure but the project is still active. `GET /v1/projects/{slug}/revisions` lists who changed a project and when.
+- `PATCH /v1/tasks/{id}` also edits `description`, `due_date` (or `dueDate`) and the project (`project_id` or `project_slug`). An edit it cannot apply returns 422.
 - **Raw captures** are unparsed. Use `capture_note` for voice memos, quick thoughts, or scraps. The write pipeline will later extract chunks and embeddings.
 
 ## Resources
