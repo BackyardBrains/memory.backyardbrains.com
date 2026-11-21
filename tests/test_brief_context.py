@@ -34,11 +34,12 @@ def _policy(cid, text, scope="global", project=None, day=1):
 
 POLICIES = [
     _policy(113900, "[coach:watson][greg-vocabulary] \"My share\" means share.backyardbrains.com.", day=21),
-    _policy(113950, "[coach:watson] the [standing-rules] note should also say dates carry a weekday.", day=22),
     _policy(113418, "[coach:watson][standing-rules] 1. Watson is the single source of truth. 2. No guessing.", day=16),
     _policy(113001, "[coach:watson][standing-rules] an older list that was replaced", day=2),
     _policy(112152, "[coach:watson] HARD: release means merge, deploy and verify live.", day=3),
     _policy(111059, "[coach:watson][decision] Recording browser: tap opens it immediately. " + "x" * 2000, scope="project", project="spikerecorder", day=4),
+    # Newest of all, but it only mentions the tag: it must not replace the rule list.
+    _policy(113950, "[coach:watson] the [standing-rules] note should also say dates carry a weekday.", day=22),
 ]
 
 
@@ -66,7 +67,7 @@ def test_brief_returns_standing_rules_whole_and_everything_else_as_excerpts(monk
     assert [r["capture_id"] for r in brief["evidence"]] == [12000]
     assert len(brief["rules_for_task"][1]["content"]) <= context.BRIEF_RULE_CHARS + 2
     assert len(brief["evidence"][0]["content"]) <= context.BRIEF_EVIDENCE_CHARS + 2
-    assert brief["rule_counts"] == {"all": 5, "standing": 4, "this_project": 0}
+    assert brief["rule_counts"] == {"all": 6, "standing": 5, "this_project": 0}
     assert len(json.dumps(brief, default=str)) < 6000
 
 
