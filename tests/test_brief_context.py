@@ -34,6 +34,7 @@ def _policy(cid, text, scope="global", project=None, day=1):
 
 POLICIES = [
     _policy(113900, "[coach:watson][greg-vocabulary] \"My share\" means share.backyardbrains.com.", day=21),
+    _policy(113950, "[coach:watson] the [standing-rules] note should also say dates carry a weekday.", day=22),
     _policy(113418, "[coach:watson][standing-rules] 1. Watson is the single source of truth. 2. No guessing.", day=16),
     _policy(113001, "[coach:watson][standing-rules] an older list that was replaced", day=2),
     _policy(112152, "[coach:watson] HARD: release means merge, deploy and verify live.", day=3),

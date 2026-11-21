@@ -69,8 +69,11 @@ BRIEF_CONTRACT = (
     'Open a record in full with GET /v1/captures/{id}. Load every rule for one project with '
     'GET /v1/context?project_slug=<slug>.'
 )
-BRIEF_STANDING_TAG = '[standing-rules]'
-BRIEF_VOCABULARY_TAG = '[greg-vocabulary]'
+# The standing rules and the vocabulary are the newest global rule that OPENS with
+# these tags. A record that only mentions a tag further in (a correction, a quoted
+# note) must not replace them.
+BRIEF_STANDING_TAG = '[coach:watson][standing-rules]'
+BRIEF_VOCABULARY_TAG = '[coach:watson][greg-vocabulary]'
 BRIEF_RULE_CHARS = 700
 BRIEF_EVIDENCE_CHARS = 600
 BRIEF_TASK_RULES = 6
@@ -96,7 +99,8 @@ def brief_packet(session, user_id, query='', project=None, client='unknown'):
         Capture.memory_visibility == 'policy').order_by(Capture.created_at.desc(), Capture.id.desc())).all()
 
     def newest_tagged(tag):
-        return next((c for c in policies if tag in (c.raw_content or '')[:300].lower()), None)
+        return next((c for c in policies if c.policy_scope == 'global'
+                     and (c.raw_content or '').lstrip().lower().startswith(tag)), None)
 
     def whole(capture):
         return dict(capture_id=capture.id, created_at=capture.created_at, content=capture.raw_content) if capture else None
