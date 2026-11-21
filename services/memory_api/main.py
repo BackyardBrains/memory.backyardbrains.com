@@ -973,6 +973,17 @@ def memory_context(q: str = Query(default='',max_length=2000),
     return context_packet(session,user_id,q,project_slug,client)
 
 
+@app.get('/v1/brief')
+def memory_brief(q: str = Query(default='',max_length=2000),
+                 project_slug: str | None = None,
+                 client: str = Query(default='unknown',min_length=1,max_length=80),
+                 session: Session = Depends(get_db_session),
+                 user_id: str = Depends(get_user_from_api_key)):
+    """Standing rules, vocabulary and the records that match one request, in a few kilobytes."""
+    from packages.memory_retrieval.context import brief_packet
+    return brief_packet(session,user_id,q,project_slug,client)
+
+
 class MemoryFeedbackBody(BaseModel):
     context_id: str
     outcome: str

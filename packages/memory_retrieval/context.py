@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,78 @@ def context_packet(session, user_id, query='', project=None, client='unknown', r
         session.add(event);session.commit()
         result.update(context_id=event.id,telemetry='context_loaded_only')
     return result
+
+
+BRIEF_CONTRACT = (
+    'This is a brief, not the complete rule list. Apply the standing rules and vocabulary to every '
+    'request. rules_for_task and evidence are the records most related to this request; a related '
+    'record does not prove an answer, so say what is unknown. Cite capture IDs for factual decisions. '
+    'Open a record in full with GET /v1/captures/{id}. Load every rule for one project with '
+    'GET /v1/context?project_slug=<slug>.'
+)
+# The standing rules and the vocabulary are the newest global rule that OPENS with
+# these tags. A record that only mentions a tag further in (a correction, a quoted
+# note) must not replace them.
+# To replace either one, save a new complete record that opens with the same tags.
+BRIEF_STANDING_TAG = re.compile(r'\s*\[coach:watson\]\s*\[standing-rules\]', re.I)
+BRIEF_VOCABULARY_TAG = re.compile(r'\s*\[coach:watson\]\s*\[greg-vocabulary\]', re.I)
+BRIEF_RULE_CHARS = 700
+BRIEF_EVIDENCE_CHARS = 600
+BRIEF_TASK_RULES = 6
+BRIEF_EVIDENCE = 5
+
+
+def _excerpt(text, limit):
+    text = (text or '').strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + ' …'
+
+
+def brief_packet(session, user_id, query='', project=None, client='unknown'):
+    """A context small enough for a chat assistant to read on every request.
+
+    The complete packet returns every active rule in full and has grown to
+    hundreds of kilobytes, which no chat client can take in. The brief returns
+    the owner's standing rules and vocabulary whole, then only the rules and
+    records that match the request, each cut to an excerpt.
+    """
+    project = normalize_project(project)
+    policies = session.exec(select(Capture).where(
+        Capture.user_id == user_id, Capture.memory_status == 'active',
+        Capture.memory_visibility == 'policy').order_by(Capture.created_at.desc(), Capture.id.desc())).all()
+
+    def newest_tagged(tag):
+        return next((c for c in policies if c.policy_scope == 'global' and tag.match(c.raw_content or '')), None)
+
+    def whole(capture):
+        return dict(capture_id=capture.id, created_at=capture.created_at, content=capture.raw_content) if capture else None
+
+    standing = newest_tagged(BRIEF_STANDING_TAG)
+    vocabulary = newest_tagged(BRIEF_VOCABULARY_TAG)
+    shown = {c.id for c in (standing, vocabulary) if c}
+    rows = search_records(query, 14, project, session, user_id) if query.strip() else []
+    rows = [r for r in rows if r['capture_id'] not in shown]
+    task_rules = [r for r in rows if r.get('memory_visibility') == 'policy'][:BRIEF_TASK_RULES]
+    rule_ids = {r['capture_id'] for r in task_rules}
+    evidence = [r for r in rows if r['capture_id'] not in rule_ids][:BRIEF_EVIDENCE]
+
+    def short(row, limit):
+        return dict(capture_id=row['capture_id'], project_slug=row.get('project_slug'),
+                    created_at=row.get('created_at'), source=row.get('source'),
+                    content=_excerpt(row.get('content') or row.get('raw_content'), limit))
+
+    missing = [name for name, found in (('standing_rules', standing), ('vocabulary', vocabulary)) if not found]
+    return dict(
+        status='incomplete' if missing else 'ok', missing=missing, mode='brief', memory_system='BYB Shared Memory', client=client,
+        project_slug=project, instructions=BRIEF_CONTRACT,
+        standing_rules=whole(standing), vocabulary=whole(vocabulary),
+        rules_for_task=[short(r, BRIEF_RULE_CHARS) for r in task_rules],
+        evidence=[short(r, BRIEF_EVIDENCE_CHARS) for r in evidence],
+        evidence_status='candidates_found' if rows else 'no_evidence' if query.strip() else 'not_requested',
+        rule_counts=dict(
+            all=len(policies),
+            standing=sum(1 for c in policies if c.policy_scope == 'global'),
+            this_project=sum(1 for c in policies if project and c.project_slug == project)),
+    )
 
 
 def record_feedback(session,user_id,context_id,outcome,capture_ids):
