@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,8 +73,9 @@ BRIEF_CONTRACT = (
 # The standing rules and the vocabulary are the newest global rule that OPENS with
 # these tags. A record that only mentions a tag further in (a correction, a quoted
 # note) must not replace them.
-BRIEF_STANDING_TAG = '[coach:watson][standing-rules]'
-BRIEF_VOCABULARY_TAG = '[coach:watson][greg-vocabulary]'
+# To replace either one, save a new complete record that opens with the same tags.
+BRIEF_STANDING_TAG = re.compile(r'\s*\[coach:watson\]\s*\[standing-rules\]', re.I)
+BRIEF_VOCABULARY_TAG = re.compile(r'\s*\[coach:watson\]\s*\[greg-vocabulary\]', re.I)
 BRIEF_RULE_CHARS = 700
 BRIEF_EVIDENCE_CHARS = 600
 BRIEF_TASK_RULES = 6
@@ -99,8 +101,7 @@ def brief_packet(session, user_id, query='', project=None, client='unknown'):
         Capture.memory_visibility == 'policy').order_by(Capture.created_at.desc(), Capture.id.desc())).all()
 
     def newest_tagged(tag):
-        return next((c for c in policies if c.policy_scope == 'global'
-                     and (c.raw_content or '').lstrip().lower().startswith(tag)), None)
+        return next((c for c in policies if c.policy_scope == 'global' and tag.match(c.raw_content or '')), None)
 
     def whole(capture):
         return dict(capture_id=capture.id, created_at=capture.created_at, content=capture.raw_content) if capture else None
@@ -119,8 +120,9 @@ def brief_packet(session, user_id, query='', project=None, client='unknown'):
                     created_at=row.get('created_at'), source=row.get('source'),
                     content=_excerpt(row.get('content') or row.get('raw_content'), limit))
 
+    missing = [name for name, found in (('standing_rules', standing), ('vocabulary', vocabulary)) if not found]
     return dict(
-        status='ok', mode='brief', memory_system='BYB Shared Memory', client=client,
+        status='incomplete' if missing else 'ok', missing=missing, mode='brief', memory_system='BYB Shared Memory', client=client,
         project_slug=project, instructions=BRIEF_CONTRACT,
         standing_rules=whole(standing), vocabulary=whole(vocabulary),
         rules_for_task=[short(r, BRIEF_RULE_CHARS) for r in task_rules],

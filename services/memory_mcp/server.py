@@ -36,10 +36,12 @@ mcp = FastMCP(
     name="Memory MCP",
     instructions=(
         "BYB Shared Memory is Greg Gage's memory for Backyard Brains and his family. In any conversation "
-        "with Greg, call byb_memory_context with his request BEFORE you answer or act, even when the request "
+        "with Greg, call byb_memory_brief with his request BEFORE you answer or act, even when the request "
         "looks simple. It returns his standing rules, his vocabulary and the records that match the request, "
         "in a few kilobytes. Apply them and cite the capture IDs you used. Related evidence is not proof of an answer. "
-        "If the call fails, say so; do not answer as if memory had been read. "
+        "If the call fails or its status is not ok, say so; do not answer as if memory had been read. "
+        "byb_memory_context returns every active rule in full (hundreds of kilobytes without a project_slug); "
+        "use it for deep work on one project, or when your instructions require the complete rule packet. "
         "Use byb_memory_feedback only for actual use or observed misses; loading context is not compliance. "
         "Use byb_memory_search for canonical recall and "
         "byb_memory_capture_verified for durable user memory. Use byb_memory_patch_capture "
@@ -108,14 +110,25 @@ def byb_memory_rules(project_slug: Optional[str] = None) -> str:
 
 
 @mcp.tool
-def byb_memory_context(query: str = '', project_slug: Optional[str] = None, client: str = 'memory-mcp', full: bool = False) -> str:
-    """Call this first, with the user's request as the query. Returns Greg's standing rules, his
-    vocabulary, and the rules and records that match the request, in a few kilobytes.
-    full=true returns every active rule in full instead (hundreds of kilobytes without a project_slug)."""
+def byb_memory_context(query: str = '', project_slug: Optional[str] = None, client: str = 'memory-mcp') -> str:
+    """Start work with all applicable active rules and up to five source-linked evidence excerpts."""
     import json
     params={'q':query,'client':client}
     if project_slug:params['project_slug']=project_slug
-    r=httpx.get(f"{MEMORY_API_URL}/v1/{'context' if full else 'brief'}",params=params,headers=_api_headers(),timeout=30.0)
+    r=httpx.get(f'{MEMORY_API_URL}/v1/context',params=params,headers=_api_headers(),timeout=30.0)
+    r.raise_for_status()
+    return json.dumps(r.json())
+
+
+@mcp.tool
+def byb_memory_brief(query: str = '', project_slug: Optional[str] = None, client: str = 'memory-mcp') -> str:
+    """Call this first in a chat, with the user's request as the query. Returns Greg's standing rules
+    and his vocabulary whole, plus excerpts of the rules and records that match the request, in a few
+    kilobytes. It is not the complete rule list; byb_memory_context is."""
+    import json
+    params={'q':query,'client':client}
+    if project_slug:params['project_slug']=project_slug
+    r=httpx.get(f'{MEMORY_API_URL}/v1/brief',params=params,headers=_api_headers(),timeout=30.0)
     r.raise_for_status()
     return json.dumps(r.json())
 

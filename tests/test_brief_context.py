@@ -93,3 +93,13 @@ def test_brief_endpoint_is_served(monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["vocabulary"]["capture_id"] == 113900
+
+
+def test_brief_says_so_when_the_rule_list_or_vocabulary_is_missing(monkeypatch):
+    monkeypatch.setattr(context, "search_records", _search)
+    only_vocabulary = [p for p in POLICIES if not context.BRIEF_STANDING_TAG.match(p.raw_content)]
+    brief = context.brief_packet(_Session(only_vocabulary), "greg", "anything")
+    assert brief["status"] == "incomplete" and brief["missing"] == ["standing_rules"]
+    assert brief["standing_rules"] is None and brief["vocabulary"]["capture_id"] == 113900
+    spaced = context.brief_packet(_Session([_policy(1, "[coach:watson] [Standing-Rules] 1. x"), POLICIES[0]]), "greg", "")
+    assert spaced["status"] == "ok" and spaced["standing_rules"]["capture_id"] == 1
